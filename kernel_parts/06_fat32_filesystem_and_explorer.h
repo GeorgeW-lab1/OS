@@ -1,0 +1,3125 @@
+#pragma once
+// 06_fat32_filesystem_and_explorer.h
+// AHCI/disk driver, the FAT32 filesystem implementation, and
+// FileExplorerWindow (the Explorer GUI).
+// Extracted from kernel.cpp (original lines 2469-4347) as part of
+// splitting the monolithic kernel into per-component files. Order matters:
+// this file relies on declarations from the kernel_parts files included
+// before it in kernel.cpp, and is itself included there in sequence --
+// it is NOT a standalone/independently-compilable translation unit.
+
+
+
+
+// =============================================================================
+// SECTION 5: DISK DRIVER & FAT32 FILESYSTEM
+// =============================================================================
+#define SATA_SIG_ATA 0x00000101
+#define PORT_CMD_ST 0x00000001
+#define PORT_CMD_FRE 0x00000010
+#define ATA_CMD_READ_DMA_EXT 0x25
+#define ATA_CMD_WRITE_DMA_EXT 0x35
+#define ATA_CMD_IDENTIFY_DEVICE 0xEC
+#define HBA_PORT_CMD_CR 0x00008000
+#define TFD_STS_BSY 0x80
+#define TFD_STS_DRQ 0x08
+#define FIS_TYPE_REG_H2D 0x27
+#define DELETED_ENTRY 0xE5
+#define ATTR_LONG_NAME 0x0F
+#define ATTR_VOLUME_ID 0x08
+#define ATTR_ARCHIVE 0x20
+#define FAT_FREE_CLUSTER 0x00000000
+#define FAT_END_OF_CHAIN 0x0FFFFFFF
+
+// =============================================================================
+// FILE EXPLORER WINDOW IMPLEMENTATION (New)
+// =============================================================================
+
+
+
+// Add these definitions near the other AHCI/FAT32 structs
+typedef volatile struct {
+    uint32_t clb;         // 0x00, command list base address, 1K-byte aligned
+    uint32_t clbu;        // 0x04, command list base address upper 32 bits
+    uint32_t fb;          // 0x08, FIS base address, 256-byte aligned
+    uint32_t fbu;         // 0x0C, FIS base address upper 32 bits
+    uint32_t is;          // 0x10, interrupt status
+    uint32_t ie;          // 0x14, interrupt enable
+    uint32_t cmd;         // 0x18, command and status
+    uint32_t rsv0;        // 0x1C, Reserved
+    uint32_t tfd;         // 0x20, task file data
+    uint32_t sig;         // 0x24, signature
+    uint32_t ssts;        // 0x28, SATA status (SCR0:SStatus)
+    uint32_t sctl;        // 0x2C, SATA control (SCR2:SControl)
+    uint32_t serr;        // 0x30, SATA error (SCR1:SError)
+    uint32_t sact;        // 0x34, SATA active (SCR3:SActive)
+    uint32_t ci;          // 0x38, command issue
+    uint32_t sntf;        // 0x3C, SATA notification (SCR4:SNotification)
+    uint32_t fbs;         // 0x40, FIS-based switching control
+    uint32_t rsv1[11];    // 0x44 ~ 0x6F, Reserved
+    uint32_t vendor[4];   // 0x70 ~ 0x7F, vendor specific
+} HBA_PORT;
+
+typedef volatile struct {
+    uint32_t cap;         // 0x00, Host capability
+    uint32_t ghc;         // 0x04, Global host control
+    uint32_t is;          // 0x08, Interrupt status
+    uint32_t pi;          // 0x0C, Port implemented
+    uint32_t vs;          // 0x10, Version
+    uint32_t ccc_ctl;     // 0x14, Command completion coalescing control
+    uint32_t ccc_pts;     // 0x18, Command completion coalescing ports
+    uint32_t em_loc;      // 0x1C, Enclosure management location
+    uint32_t em_ctl;      // 0x20, Enclosure management control
+    uint32_t cap2;        // 0x24, Host capabilities extended
+    uint32_t bohc;        // 0x28, BIOS/OS handoff control and status
+    uint8_t  rsv[0x60-0x2C];
+    uint8_t  vendor[0x90-0x60]; // Vendor specific registers
+    HBA_PORT ports[1];    // 0x90 ~ HBA memory mapped space, 1 ~ 32 ports
+} HBA_MEM;
+
+
+typedef struct { 
+    uint8_t order; 
+    uint16_t name1[5]; 
+    uint8_t attr; 
+    uint8_t type; 
+    uint8_t checksum; 
+    uint16_t name2[6]; 
+    uint16_t fst_clus_lo; 
+    uint16_t name3[2]; 
+} __attribute__((packed)) fat_lfn_entry_t;
+
+uint8_t lfn_checksum(const unsigned char *p_fname) {
+    uint8_t sum = 0;
+    for (int i = 11; i; i--) {
+        sum = ((sum & 1) ? 0x80 : 0) + (sum >> 1) + *p_fname++;
+    }
+    return sum;
+}
+
+static int g_ahci_port = -1; // Will store the first active port number
+static int g_selected_port = -1; // User-selected disk port (-1 = use g_ahci_port)
+static bool g_disk_unlocked = false;
+static char g_disk_password_file[] = ".diskpass";
+typedef struct { uint8_t cfl:5, a:1, w:1, p:1, r:1, b:1, c:1, res0:1; uint16_t prdtl; volatile uint32_t prdbc; uint64_t ctba; uint32_t res1[4]; } __attribute__((packed)) HBA_CMD_HEADER;
+typedef struct { uint64_t dba; uint32_t res0; uint32_t dbc:22, res1:9, i:1; } __attribute__((packed)) HBA_PRDT_ENTRY;
+typedef struct { uint8_t fis_type, pmport:4, res0:3, c:1, command, featurel; uint8_t lba0, lba1, lba2, device; uint8_t lba3, lba4, lba5, featureh; uint8_t countl, counth, icc, control; uint8_t res1[4]; } __attribute__((packed)) FIS_REG_H2D;
+typedef struct { uint8_t jmp[3]; char oem[8]; uint16_t bytes_per_sec; uint8_t sec_per_clus; uint16_t rsvd_sec_cnt; uint8_t num_fats; uint16_t root_ent_cnt; uint16_t tot_sec16; uint8_t media; uint16_t fat_sz16; uint16_t sec_per_trk; uint16_t num_heads; uint32_t hidd_sec; uint32_t tot_sec32; uint32_t fat_sz32; uint16_t ext_flags; uint16_t fs_ver; uint32_t root_clus; uint16_t fs_info; uint16_t bk_boot_sec; uint8_t res[12]; uint8_t drv_num; uint8_t res1; uint8_t boot_sig; uint32_t vol_id; char vol_lab[11]; char fil_sys_type[8]; } __attribute__((packed)) fat32_bpb_t;
+
+
+static uint64_t ahci_base = 0;
+static HBA_CMD_HEADER* cmd_list;
+static char* cmd_table_buffer;
+// FIS receive buffer. Promoted from a disk_init() local to a global so
+// ahci_port_setup() can program PxFB/PxFBU for any port, not just the
+// one disk_init() auto-selected.
+static char* g_ahci_fis_buffer = nullptr;
+static fat32_bpb_t bpb;
+static uint32_t fat_start_sector, data_start_sector;
+static uint32_t current_directory_cluster = 0;
+// Human-readable form of current_directory_cluster, kept in sync by cd/
+// fat32_resolve_path(). Purely cosmetic/navigational (pwd, shell prompt) --
+// the cluster number above is what actually drives every disk operation.
+static char current_directory_path[256] = "/";
+// Absolute disk LBA of the FAT32 partition's first sector (0 if the disk
+// is a raw FAT32 image with no partition table — e.g. mkfat32.py output).
+// Set by fat32_init when an MBR/GPT FAT32 partition is located; used by
+// fat32_format so a format command on a partitioned bare-metal disk
+// rewrites the partition's BPB instead of clobbering the MBR.
+static uint64_t g_partition_lba = 0;
+
+// --- Aligned Memory Allocator ---
+void* alloc_aligned(size_t size, size_t alignment) {
+    size_t offset = alignment - 1 + sizeof(void*);
+    void* p1 = operator new(size + offset);
+    if (p1 == nullptr) return nullptr;
+    void** p2 = (void**)(((uintptr_t)p1 + offset) & ~(alignment - 1));
+    p2[-1] = p1;
+    return p2;
+}
+
+void free_aligned(void* ptr) {
+    if (ptr == nullptr) return;
+    operator delete(((void**)ptr)[-1]);
+}
+// Forward declarations: stop_cmd / start_cmd are defined further down
+// (after read_write_sectors) but ahci_port_setup below needs them.
+void stop_cmd(HBA_PORT* port);
+void start_cmd(HBA_PORT* port);
+
+// Program one AHCI port's command-list / FIS base registers and start
+// its command engine. disk_init() did this inline for the single port
+// it auto-selected; select_disk could then switch g_ahci_port to a
+// DIFFERENT implemented port whose clb/fb were never programmed, so
+// every subsequent command against it stalled (port->ci never cleared)
+// and all I/O failed. Both callers now go through this so any port the
+// kernel talks to is always fully initialised first.
+//
+// Returns true if the port has a device present and was set up.
+static bool ahci_port_setup(int port_index) {
+    if (!ahci_base || port_index < 0 || port_index >= 32) return false;
+    if (!cmd_list || !cmd_table_buffer) return false;
+
+    HBA_PORT* port = (HBA_PORT*)(ahci_base + 0x100 + (port_index * 0x80));
+
+    uint8_t det = port->ssts & 0x0F;
+    uint8_t ipm = (port->ssts >> 8) & 0x0F;
+    if (det != 3 || ipm != 1) return false;     // no active device
+
+    stop_cmd(port);
+
+    port->clb  = (uint32_t)(uintptr_t)cmd_list;
+    port->clbu = (uint32_t)(((uint64_t)(uintptr_t)cmd_list) >> 32);
+    port->fb   = (uint32_t)(uintptr_t)g_ahci_fis_buffer;
+    port->fbu  = (uint32_t)(((uint64_t)(uintptr_t)g_ahci_fis_buffer) >> 32);
+
+    port->serr = 0xFFFFFFFF;
+    port->is   = 0xFFFFFFFF;                    // clear stale interrupts
+
+    start_cmd(port);
+    return true;
+}
+
+void cmd_list_and_select_disk(const char* arg) {
+    // List all detected AHCI ports
+    if (!ahci_base) {
+        wm.print_to_focused("No AHCI controller found.\n");
+        return;
+    }
+
+    uint32_t ports_implemented = *(volatile uint32_t*)(ahci_base + 0x0C);
+    char msg[128];
+
+    if (!arg || arg[0] == '\0') {
+        // No argument: list available disks
+        wm.print_to_focused("Available disks:\n");
+        bool found = false;
+        for (int i = 0; i < 32; i++) {
+            if (!(ports_implemented & (1 << i))) continue;
+            HBA_PORT* port = (HBA_PORT*)(ahci_base + 0x100 + (i * 0x80));
+            uint8_t det = port->ssts & 0x0F;
+            uint8_t ipm = (port->ssts >> 8) & 0x0F;
+            if (det != 3 || ipm != 1) continue;
+
+            int active = (i == g_ahci_port) ? 1 : 0;
+            int selected = (i == g_selected_port || (g_selected_port == -1 && i == g_ahci_port)) ? 1 : 0;
+
+            snprintf(msg, 128, "  Port %d: %s%s\n",
+                     i,
+                     active  ? "[AHCI] " : "",
+                     selected ? "<-- selected" : "");
+            wm.print_to_focused(msg);
+            found = true;
+        }
+        if (!found) wm.print_to_focused("  (no drives detected)\n");
+        wm.print_to_focused("Usage: select_disk <port>\n");
+        return;
+    }
+
+    // Argument given: select that port
+    int requested = simple_atoi(arg);
+    if (!(ports_implemented & (1 << requested))) {
+        snprintf(msg, 128, "Port %d not implemented.\n", requested);
+        wm.print_to_focused(msg);
+        return;
+    }
+
+    HBA_PORT* port = (HBA_PORT*)(ahci_base + 0x100 + (requested * 0x80));
+    uint8_t det = port->ssts & 0x0F;
+    uint8_t ipm = (port->ssts >> 8) & 0x0F;
+    if (det != 3 || ipm != 1) {
+        snprintf(msg, 128, "Port %d has no active drive (det=%d ipm=%d).\n", requested, det, ipm);
+        wm.print_to_focused(msg);
+        return;
+    }
+
+    // Switch disk. Program the target port's command-list / FIS base
+    // and start its command engine BEFORE issuing any I/O to it —
+    // disk_init() only set up the port it auto-selected, so without this
+    // a switch to any other port left it uninitialised and every read
+    // or write against it stalled.
+    if (!ahci_port_setup(requested)) {
+        snprintf(msg, 128, "Port %d setup failed.\n", requested);
+        wm.print_to_focused(msg);
+        return;
+    }
+    g_selected_port = requested;
+    g_ahci_port     = requested;           // redirect all I/O immediately
+
+    // Re-initialise FAT32 on the new disk
+    bool ok = fat32_init();
+    snprintf(msg, 128, "Switched to disk port %d. FAT32: %s\n",
+             requested, ok ? "OK" : "not found / failed");
+    wm.print_to_focused(msg);
+
+    if (ok) wm.load_desktop_items();      // refresh desktop icons from new disk
+}int read_write_sectors(int port_num, uint64_t lba, uint16_t count,
+                       bool write, void* buffer) {
+    if (port_num < 0 || port_num >= 32 || !ahci_base) return -1;
+
+    HBA_PORT* port = (HBA_PORT*)(ahci_base + 0x100 + (port_num * 0x80));
+    port->is = 0xFFFFFFFF;
+
+    uint32_t slots = (port->sact | port->ci);
+    int slot = -1;
+    for (int i = 0; i < 32; i++) {
+        if ((slots & (1 << i)) == 0) { slot = i; break; }
+    }
+    if (slot == -1) return -1;
+
+    // --- WRITE PATH: encrypt a copy before sending to disk ---
+    uint8_t* enc_buf = nullptr;
+    void*    io_buf  = buffer;
+
+    if (write && g_fs_encryption_enabled) {
+        enc_buf = new uint8_t[count * SECTOR_SIZE];
+        if (!enc_buf) return -1;
+        memcpy(enc_buf, buffer, count * SECTOR_SIZE);
+        for (int s = 0; s < count; s++) {
+            xor_sector(enc_buf + s * SECTOR_SIZE, lba + s);
+        }
+        io_buf = enc_buf;
+    }
+
+    HBA_CMD_HEADER* cmd_header = &cmd_list[slot];
+    cmd_header->cfl    = sizeof(FIS_REG_H2D) / sizeof(uint32_t);
+    cmd_header->w      = write;
+    cmd_header->prdtl  = 1;
+
+    uintptr_t       cmd_table_addr = (uintptr_t)cmd_header->ctba;
+    FIS_REG_H2D*    cmd_fis        = (FIS_REG_H2D*)(cmd_table_addr);
+    HBA_PRDT_ENTRY* prdt           = (HBA_PRDT_ENTRY*)(cmd_table_addr + 128);
+
+    prdt->dba = (uint64_t)(uintptr_t)io_buf;
+    prdt->dbc = (count * SECTOR_SIZE) - 1;
+    prdt->i   = 0;
+
+    memset(cmd_fis, 0, sizeof(FIS_REG_H2D));
+    cmd_fis->fis_type = FIS_TYPE_REG_H2D;
+    cmd_fis->c        = 1;
+    cmd_fis->command  = write ? ATA_CMD_WRITE_DMA_EXT : ATA_CMD_READ_DMA_EXT;
+    cmd_fis->lba0     = (uint8_t)lba;
+    cmd_fis->lba1     = (uint8_t)(lba >> 8);
+    cmd_fis->lba2     = (uint8_t)(lba >> 16);
+    cmd_fis->device   = 1 << 6;
+    cmd_fis->lba3     = (uint8_t)(lba >> 24);
+    cmd_fis->lba4     = (uint8_t)(lba >> 32);
+    cmd_fis->lba5     = (uint8_t)(lba >> 40);
+    cmd_fis->countl   = count & 0xFF;
+    cmd_fis->counth   = (count >> 8) & 0xFF;
+
+    while (port->tfd & (TFD_STS_BSY | TFD_STS_DRQ));
+    port->ci = (1 << slot);
+
+    // Wait for the command slot to clear. The previous budget (100000
+    // tight-loop iterations) was far too small: a real DMA write —
+    // especially the first WRITE_DMA_EXT after the command engine has
+    // been idle, e.g. the boot-sector write in formatfs — routinely did
+    // not finish within it, so the function returned -1 and the format
+    // reported "Failed to write new boot sector". Reads happened to fit
+    // the old budget often enough to look reliable. Use a much larger
+    // budget and ALSO bail out early on a real task-file error rather
+    // than relying on the spin count alone.
+    const long IO_TIMEOUT = 200000000L;   // generous; covers slow writes
+    long spin = 0;
+    bool timed_out = false;
+    while (true) {
+        if ((port->ci & (1 << slot)) == 0) break;   // command finished
+        if (port->is & (1 << 30)) break;            // TFES: task-file error
+        if (++spin >= IO_TIMEOUT) { timed_out = true; break; }
+    }
+
+    if (enc_buf) { delete[] enc_buf; enc_buf = nullptr; }
+
+    if (timed_out) return -1;
+    // Real error if the TFES interrupt fired OR the task-file register
+    // reports ERR (bit 0). PxTFD.STS bit0 = ERR; checking it catches a
+    // device-rejected command even when PxIS bit 30 was already cleared.
+    if (port->is & (1 << 30)) return -1;
+    if (port->tfd & 0x01)     return -1;
+
+    // --- READ PATH: decrypt in place after receiving from disk ---
+    if (!write && g_fs_encryption_enabled) {
+        for (int s = 0; s < count; s++) {
+            xor_sector((uint8_t*)buffer + s * SECTOR_SIZE, lba + s);
+        }
+    }
+
+    return 0;
+}
+
+// Issues ATA IDENTIFY DEVICE (0xEC) through the same AHCI command-slot
+// mechanics as read_write_sectors() (it's still a single-sector PIO-data-in
+// transfer as far as the HBA/PRDT are concerned), and pulls the drive's
+// real total sector count out of the returned 512-byte identify buffer:
+//   words 100-103: 48-bit LBA total sector count (used when the drive
+//                  reports 48-bit addressing support, word 83 bit 10)
+//   words 60-61:   28-bit LBA total sector count (fallback)
+// Returns 0 and leaves *out_total_sectors untouched on any failure, so
+// callers can fall back to a known-safe default instead of formatting
+// using garbage.
+int ahci_get_disk_total_sectors(int port_num, uint64_t* out_total_sectors) {
+    if (port_num < 0 || port_num >= 32 || !ahci_base) return -1;
+
+    HBA_PORT* port = (HBA_PORT*)(ahci_base + 0x100 + (port_num * 0x80));
+    port->is = 0xFFFFFFFF;
+
+    uint32_t slots = (port->sact | port->ci);
+    int slot = -1;
+    for (int i = 0; i < 32; i++) {
+        if ((slots & (1 << i)) == 0) { slot = i; break; }
+    }
+    if (slot == -1) return -1;
+
+    uint16_t* id_buf = new uint16_t[256]; // IDENTIFY DEVICE is always exactly 512 bytes
+
+    HBA_CMD_HEADER* cmd_header = &cmd_list[slot];
+    cmd_header->cfl    = sizeof(FIS_REG_H2D) / sizeof(uint32_t);
+    cmd_header->w      = 0; // device -> host
+    cmd_header->prdtl  = 1;
+
+    uintptr_t       cmd_table_addr = (uintptr_t)cmd_header->ctba;
+    FIS_REG_H2D*    cmd_fis        = (FIS_REG_H2D*)(cmd_table_addr);
+    HBA_PRDT_ENTRY* prdt           = (HBA_PRDT_ENTRY*)(cmd_table_addr + 128);
+
+    prdt->dba = (uint64_t)(uintptr_t)id_buf;
+    prdt->dbc = SECTOR_SIZE - 1;
+    prdt->i   = 0;
+
+    memset(cmd_fis, 0, sizeof(FIS_REG_H2D));
+    cmd_fis->fis_type = FIS_TYPE_REG_H2D;
+    cmd_fis->c        = 1;
+    cmd_fis->command  = ATA_CMD_IDENTIFY_DEVICE;
+    cmd_fis->device   = 0; // master, no LBA bits needed for IDENTIFY
+
+    while (port->tfd & (TFD_STS_BSY | TFD_STS_DRQ));
+    port->ci = (1 << slot);
+
+    const long IO_TIMEOUT = 200000000L;
+    long spin = 0;
+    bool timed_out = false;
+    while (true) {
+        if ((port->ci & (1 << slot)) == 0) break;
+        if (port->is & (1 << 30)) break;
+        if (++spin >= IO_TIMEOUT) { timed_out = true; break; }
+    }
+
+    bool failed = timed_out || (port->is & (1 << 30)) || (port->tfd & 0x01);
+    if (failed) { delete[] id_buf; return -1; }
+
+    uint64_t lba48 = ((uint64_t)id_buf[100])       | ((uint64_t)id_buf[101] << 16) |
+                      ((uint64_t)id_buf[102] << 32) | ((uint64_t)id_buf[103] << 48);
+    uint64_t lba28 = ((uint32_t)id_buf[60]) | ((uint32_t)id_buf[61] << 16);
+    bool supports_lba48 = (id_buf[83] & (1 << 10)) != 0;
+
+    uint64_t total = (supports_lba48 && lba48 > 0) ? lba48 : lba28;
+    delete[] id_buf;
+    if (total == 0) return -1;
+
+    *out_total_sectors = total;
+    return 0;
+}
+void stop_cmd(HBA_PORT *port) {
+    port->cmd &= ~0x0001; // Clear ST (Start)
+    port->cmd &= ~0x0010; // Clear FRE (FIS Receive Enable)
+
+    // Wait until Command List Running (CR) and FIS Receive Running (FR) are cleared
+    while(port->cmd & 0x8000 || port->cmd & 0x4000);
+}
+
+// Helper to start a port's command engine
+void start_cmd(HBA_PORT *port) {
+    // Wait until Command List Running (CR) is cleared
+    while(port->cmd & 0x8000);
+
+    port->cmd |= 0x0010; // Set FRE (FIS Receive Enable)
+    port->cmd |= 0x0001; // Set ST (Start)
+}
+void disk_init() {
+    // ─────────────────────────────────────────────────────────────────────
+    // Find the AHCI controller on PCI.
+    //
+    // Why the previous one-liner missed real hardware:
+    //   1. It only checked function 0. On every Intel chipset the SATA
+    //      controller lives at 00:1F.2 — bus 0, dev 0x1F, function 2.
+    //      QEMU and VMware happened to put theirs on function 0, which
+    //      is why those worked while bare metal never did.
+    //   2. It only matched class/subclass 0x0106 (SATA/AHCI). Many
+    //      consumer machines (Dell, HP, Lenovo) ship with BIOS default
+    //      "RAID On", in which case the same hardware reports 0x0104
+    //      (RAID) while still being AHCI-compatible underneath. Some
+    //      Marvell/ASMedia add-in cards report 0x0180 ("Other").
+    //   3. It scanned only 8 buses. Cheap to widen.
+    // ─────────────────────────────────────────────────────────────────────
+    ahci_base = 0;
+    uint16_t found_bus = 0; uint8_t found_dev = 0; uint8_t found_fn = 0;
+    bool found = false;
+
+    for (uint16_t bus = 0; bus < 256 && !found; bus++) {
+        for (uint8_t dev = 0; dev < 32 && !found; dev++) {
+            for (uint8_t fn = 0; fn < 8 && !found; fn++) {
+                uint32_t vd = pci_read_config_dword(bus, dev, fn, 0x00);
+                if ((vd & 0xFFFFu) == 0xFFFFu) continue;   // empty slot
+
+                uint32_t cc = pci_read_config_dword(bus, dev, fn, 0x08);
+                uint8_t base_class = (cc >> 24) & 0xFFu;
+                uint8_t subclass   = (cc >> 16) & 0xFFu;
+
+                if (base_class != 0x01) continue;          // not mass storage
+                // Accept SATA(6), RAID(4), and Other(0x80).
+                if (subclass != 0x06 && subclass != 0x04 && subclass != 0x80)
+                    continue;
+
+                // BAR5 = ABAR (AHCI Base Memory Register).
+                uint32_t bar5 = pci_read_config_dword(bus, dev, fn, 0x24);
+                if (bar5 & 1u) continue;                    // I/O BAR, not MMIO
+                uint32_t abar = bar5 & 0xFFFFFFF0u;
+                if (abar < 0x1000u) continue;               // empty / unmapped
+
+                ahci_base = abar;
+                found_bus = bus; found_dev = dev; found_fn = fn;
+                found = true;
+            }
+        }
+    }
+
+    if (!ahci_base) {
+        wm.print_to_focused("AHCI: no controller found on any PCI bus.\n");
+        wm.print_to_focused("  On bare metal: set SATA mode to AHCI in BIOS\n");
+        wm.print_to_focused("  (look for 'SATA Operation' / 'SATA Mode Selection').\n");
+        return;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Enable bus-master + memory-space decode in the PCI command register.
+    // Firmware *usually* leaves these on for the boot device, but UEFI
+    // platforms that booted via NVMe/USB sometimes leave the SATA
+    // controller un-enabled.
+    // ─────────────────────────────────────────────────────────────────────
+    {
+        uint32_t cmd = pci_read_config_dword(found_bus, found_dev, found_fn, 0x04);
+        uint32_t addr_reg = 0x80000000u
+                          | ((uint32_t)found_bus << 16)
+                          | ((uint32_t)found_dev << 11)
+                          | ((uint32_t)found_fn  <<  8)
+                          | 0x04u;
+        outl(0xCF8, addr_reg);
+        outl(0xCFC, cmd | 0x06u);    // bit 1 = memory, bit 2 = bus master
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Engage AHCI mode (GHC.AE = bit 31 of Global Host Control at MMIO
+    // offset 0x04). Needed when the HBA came up in legacy / IDE-compat
+    // mode, which is common on Intel chipsets where the firmware didn't
+    // explicitly flip the mode-select bit during POST.
+    // ─────────────────────────────────────────────────────────────────────
+    {
+        volatile uint32_t* ghc = (volatile uint32_t*)(uintptr_t)(ahci_base + 0x04);
+        *ghc |= (1u << 31);                                  // AE
+        // Brief spin so the HBA acknowledges before we read PxSSTS / PI.
+        for (volatile uint32_t i = 0; i < 100000u; i++);
+    }
+
+    {
+        char msg[96];
+        snprintf(msg, sizeof(msg),
+                 "AHCI: found at %02x:%02x.%x  ABAR=0x%08x\n",
+                 (unsigned)found_bus, (unsigned)found_dev, (unsigned)found_fn,
+                 (unsigned)ahci_base);
+        wm.print_to_focused(msg);
+    }
+
+    // ── Allocate command list / FIS / cmd-table buffers ─────────────────
+    cmd_list = (HBA_CMD_HEADER*)alloc_aligned(32 * sizeof(HBA_CMD_HEADER), 1024);
+    cmd_table_buffer = (char*)alloc_aligned(32 * 256, 128);
+    g_ahci_fis_buffer = (char*)alloc_aligned(256, 256);
+
+    if (!cmd_list || !cmd_table_buffer || !g_ahci_fis_buffer) return;
+
+    for(int k=0; k<32; ++k) {
+        cmd_list[k].ctba = (uint64_t)(uintptr_t)(cmd_table_buffer + (k * 256));
+    }
+
+    uint32_t ports_implemented = *(volatile uint32_t*)(uintptr_t)(ahci_base + 0x0C);
+
+    // Auto-select a port. Two passes so a SATA disk on port 1 is preferred
+    // over an ATAPI CD-ROM on port 0 (which is exactly the QEMU layout in
+    // compile.md — `bus=ahci.0` for the CD, `bus=ahci.1` for the HDD).
+    //
+    // PxSIG (port offset 0x24) tells us what kind of device is attached:
+    //   0x00000101 = SATA disk
+    //   0xEB140101 = SATAPI / ATAPI (CD-ROM, DVD, etc.)
+    //   0xC33C0101 = enclosure-management bridge
+    //   0x96690101 = port multiplier
+    //
+    // Pass 1: claim the first SATA disk.
+    // Pass 2: fall back to anything else (so we don't strand a CD-only
+    // configuration with no port selected at all).
+    auto try_select = [&](bool sata_only) -> bool {
+        for (int i = 0; i < 32; i++) {
+            if (!(ports_implemented & (1u << i))) continue;
+            volatile HBA_PORT* p = (volatile HBA_PORT*)(uintptr_t)
+                                    (ahci_base + 0x100 + (i * 0x80));
+            uint32_t sig = p->sig;
+            if (sata_only && sig != 0x00000101u) continue;
+            if (ahci_port_setup(i)) {
+                g_ahci_port = i;
+                char msg[80];
+                const char* kind = (sig == 0x00000101u) ? "SATA disk"
+                                 : (sig == 0xEB140101u) ? "ATAPI (CD/DVD)"
+                                 : "unknown";
+                snprintf(msg, sizeof(msg),
+                         "AHCI: port %d active (%s).\n", i, kind);
+                wm.print_to_focused(msg);
+                return true;
+            }
+        }
+        return false;
+    };
+    if (try_select(true))  return;     // first SATA disk
+    if (try_select(false)) return;     // fall back to anything
+    wm.print_to_focused("AHCI: controller found but no active drive on any port.\n");
+}bool fat32_init() {
+    if (!ahci_base) return false;
+
+    // Boot sector is always plaintext — read it raw regardless of crypto state
+    bool was_enabled = g_fs_encryption_enabled;
+    g_fs_encryption_enabled = false;
+
+    char* buffer = new char[SECTOR_SIZE];
+    if (!buffer) {
+        g_fs_encryption_enabled = was_enabled;
+        return false;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Sector 0 can be one of three things on a real disk:
+    //   (a) Raw FAT32 boot sector — what mkfat32.py produces for QEMU/VMware.
+    //       Identifiable by "FAT32   " string at offset 82.
+    //   (b) Classic MBR — first 446 bytes are bootstrap, then a 4-entry
+    //       partition table at offset 446, then signature 0x55 0xAA at 510.
+    //       FAT32 partition types are 0x0B, 0x0C, 0x1B, 0x1C.
+    //   (c) GPT protective MBR — signature 0x55 0xAA at 510, but the
+    //       partition table contains exactly one entry of type 0xEE
+    //       spanning the disk; the real GPT header lives at LBA 1, with
+    //       128-byte entries starting at LBA 2 (or wherever the header
+    //       says).
+    //
+    // We resolve the FAT32 partition's start LBA into partition_lba.
+    // fat_start_sector / data_start_sector then carry absolute disk LBAs,
+    // so cluster_to_lba and read_fat_entry keep working unchanged.
+    // ─────────────────────────────────────────────────────────────────────
+    if (read_write_sectors(g_ahci_port, 0, 1, false, buffer) != 0) {
+        g_fs_encryption_enabled = was_enabled;
+        delete[] buffer;
+        return false;
+    }
+
+    uint64_t partition_lba = 0;
+    bool     found_fat32   = false;
+    bool     sector0_is_fat32 = (strncmp(buffer + 82, "FAT32", 5) == 0);
+    bool     has_mbr_sig =
+        ((uint8_t)buffer[510] == 0x55 && (uint8_t)buffer[511] == 0xAA);
+
+    if (sector0_is_fat32) {
+        // (a) Raw image. Sector 0 itself is the BPB. partition_lba stays 0.
+        found_fat32 = true;
+    } else if (has_mbr_sig) {
+        // Detect GPT protective MBR vs classic MBR.
+        bool is_protective_mbr = false;
+        for (int i = 0; i < 4; i++) {
+            if ((uint8_t)buffer[446 + i*16 + 4] == 0xEE) {
+                is_protective_mbr = true;
+                break;
+            }
+        }
+
+        if (is_protective_mbr) {
+            // ───── (c) GPT path ────────────────────────────────────────
+            // Read GPT header at LBA 1. Header layout (only the fields
+            // we need): signature "EFI PART" at offset 0, partition-
+            // entry LBA at offset 72 (8 bytes), num_entries at offset 80
+            // (4 bytes), entry_size at offset 84 (4 bytes).
+            char* gpt_hdr = new char[SECTOR_SIZE];
+            if (gpt_hdr &&
+                read_write_sectors(g_ahci_port, 1, 1, false, gpt_hdr) == 0 &&
+                strncmp(gpt_hdr, "EFI PART", 8) == 0)
+            {
+                uint64_t pe_lba   = *(uint64_t*)(gpt_hdr + 72);
+                uint32_t pe_count = *(uint32_t*)(gpt_hdr + 80);
+                uint32_t pe_size  = *(uint32_t*)(gpt_hdr + 84);
+
+                // Sanity-cap; GPT spec mandates >= 128 entries, 128-byte size.
+                if (pe_count > 256) pe_count = 256;
+                if (pe_size  < 128 || pe_size > SECTOR_SIZE) pe_size = 128;
+
+                uint32_t entries_per_sector = SECTOR_SIZE / pe_size;
+                uint32_t sectors_to_read    =
+                    (pe_count + entries_per_sector - 1) / entries_per_sector;
+
+                char* entries = new char[SECTOR_SIZE];
+                for (uint32_t s = 0;
+                     entries && s < sectors_to_read && !found_fat32; s++)
+                {
+                    if (read_write_sectors(g_ahci_port, pe_lba + s, 1,
+                                           false, entries) != 0) break;
+                    for (uint32_t e = 0;
+                         e < entries_per_sector && !found_fat32; e++)
+                    {
+                        char*    ent       = entries + e * pe_size;
+                        uint64_t first_lba = *(uint64_t*)(ent + 32);
+                        if (first_lba == 0) continue;   // empty slot
+
+                        // Don't filter on type-GUID — just probe each
+                        // partition's first sector for the FAT32 string.
+                        // Avoids hard-coding the Microsoft Basic Data
+                        // GUID (which most FAT32 ESP/data partitions
+                        // use, but some installers vary).
+                        if (read_write_sectors(g_ahci_port, first_lba, 1,
+                                               false, buffer) != 0) continue;
+                        if (strncmp(buffer + 82, "FAT32", 5) == 0) {
+                            partition_lba = first_lba;
+                            found_fat32   = true;
+                        }
+                    }
+                }
+                delete[] entries;
+            }
+            delete[] gpt_hdr;
+        } else {
+            // ───── (b) Classic MBR path ────────────────────────────────
+            // Walk the 4-entry partition table. Take the first FAT32
+            // partition whose boot sector verifies.
+            for (int i = 0; i < 4 && !found_fat32; i++) {
+                uint8_t* part = (uint8_t*)(buffer + 446 + i * 16);
+                uint8_t  type = part[4];
+                if (type != 0x0B && type != 0x0C &&
+                    type != 0x1B && type != 0x1C) continue;
+
+                uint64_t lba = (uint64_t) part[8]         |
+                               ((uint64_t)part[9]  <<  8) |
+                               ((uint64_t)part[10] << 16) |
+                               ((uint64_t)part[11] << 24);
+                if (lba == 0) continue;
+
+                if (read_write_sectors(g_ahci_port, lba, 1, false, buffer) == 0
+                    && strncmp(buffer + 82, "FAT32", 5) == 0)
+                {
+                    partition_lba = lba;
+                    found_fat32   = true;
+                }
+            }
+        }
+    }
+
+    g_fs_encryption_enabled = was_enabled;
+
+    if (!found_fat32) {
+        delete[] buffer;
+        current_directory_cluster = 0;
+        if (sector0_is_fat32) {
+            // Shouldn't happen — we already set found_fat32 above.
+        } else if (has_mbr_sig) {
+            wm.print_to_focused("FAT32: partition table present, but no FAT32 partition.\n");
+            wm.print_to_focused("  Create one (MBR type 0x0C, or GPT 'Microsoft Basic Data').\n");
+        } else {
+            wm.print_to_focused("FAT32: disk has no partition table and no FAT32 BPB.\n");
+            wm.print_to_focused("  Either format the disk or write a raw FAT32 image.\n");
+        }
+        return false;
+    }
+
+    // `buffer` now holds the FAT32 BPB (sector 0 directly, or the
+    // partition's first sector via MBR/GPT lookup).
+    memcpy(&bpb, buffer, sizeof(bpb));
+    delete[] buffer;
+
+    if (strncmp(bpb.fil_sys_type, "FAT32", 5) != 0) {
+        // Defensive: shouldn't trigger because we verified above.
+        current_directory_cluster = 0;
+        return false;
+    }
+
+    // fat_start_sector / data_start_sector hold ABSOLUTE disk LBAs.
+    // partition_lba == 0 for the raw-image case, so QEMU/VMware
+    // behaviour is byte-for-byte unchanged.
+    g_partition_lba   = partition_lba;
+    fat_start_sector  = partition_lba + bpb.rsvd_sec_cnt;
+    data_start_sector = fat_start_sector + (bpb.num_fats * bpb.fat_sz32);
+    current_directory_cluster = bpb.root_clus;
+
+    if (partition_lba) {
+        char msg[96];
+        snprintf(msg, sizeof(msg),
+                 "FAT32: partition @ LBA %u, root_clus %u\n",
+                 (unsigned)partition_lba, (unsigned)current_directory_cluster);
+        wm.print_to_focused(msg);
+    }
+    return true;
+}
+uint64_t cluster_to_lba(uint32_t cluster) {
+  return (uint64_t)(cluster - 2) * bpb.sec_per_clus + data_start_sector;
+}
+
+// Number of clusters in the FAT32 filesystem, computed entirely from BPB
+// fields so it is independent of where on the disk the partition lives.
+// The old formula `bpb.tot_sec32 - data_start_sector` worked only when
+// data_start_sector was partition-relative; once we support MBR/GPT,
+// data_start_sector holds the absolute disk LBA and the subtraction
+// underflows. This helper sidesteps the issue.
+static inline uint32_t fat32_data_sectors() {
+    uint32_t reserved = bpb.rsvd_sec_cnt;
+    uint32_t fats     = bpb.num_fats * bpb.fat_sz32;
+    uint32_t fs_total = bpb.tot_sec32;
+    if (fs_total <= reserved + fats) return 0;
+    return fs_total - reserved - fats;
+}
+static inline uint32_t fat32_max_clusters() {
+    if (bpb.sec_per_clus == 0) return 0;
+    return fat32_data_sectors() / bpb.sec_per_clus + 2;
+}void to_83_format(const char* filename, char* out) { memset(out, ' ', 11); int i = 0, j = 0; while (filename[i] && filename[i] != '.' && j < 8) { out[j++] = (filename[i] >= 'a' && filename[i] <= 'z') ? (filename[i]-32) : filename[i]; i++; } if(filename[i] == '.') i++; j=8; while(filename[i] && j<11) { out[j++] = (filename[i] >= 'a' && filename[i] <= 'z') ? (filename[i]-32) : filename[i]; i++; } }
+
+void from_83_format(const char* fat_name, char* out) {
+    int i, j = 0;
+    // Process the name part (before the extension)
+    for (i = 0; i < 8 && fat_name[i] != ' '; i++) {
+        // Only convert uppercase letters to lowercase
+        out[j++] = (fat_name[i] >= 'A' && fat_name[i] <= 'Z') ? fat_name[i] + 32 : fat_name[i];
+    }
+    
+    // Process the extension part, if it exists
+    if (fat_name[8] != ' ') {
+        out[j++] = '.';
+        for (i = 8; i < 11 && fat_name[i] != ' '; i++) {
+            // Only convert uppercase letters to lowercase
+            out[j++] = (fat_name[i] >= 'A' && fat_name[i] <= 'Z') ? fat_name[i] + 32 : fat_name[i];
+        }
+    }
+    out[j] = '\0';
+}
+
+void fat32_get_fne_from_entry(fat_dir_entry_t* entry, char* out) {
+    from_83_format(entry->name, out);
+}
+
+uint32_t read_fat_entry(uint32_t cluster) {
+    uint8_t* fat_sector = new uint8_t[SECTOR_SIZE];
+    uint32_t fat_offset = cluster * 4;
+
+    read_write_sectors(g_ahci_port, fat_start_sector + (fat_offset / SECTOR_SIZE), 1, false, fat_sector);
+    uint32_t value = *(uint32_t*)(fat_sector + (fat_offset % SECTOR_SIZE)) & 0x0FFFFFFF;
+    delete[] fat_sector;
+    return value;
+}
+
+bool write_fat_entry(uint32_t cluster, uint32_t value) {
+    uint8_t* fat_sector = new uint8_t[SECTOR_SIZE];
+    uint32_t fat_offset = cluster * 4;
+    uint32_t fat_sector_index = fat_offset / SECTOR_SIZE;
+    uint32_t sector_num = fat_start_sector + fat_sector_index;
+
+    read_write_sectors(g_ahci_port, sector_num, 1, false, fat_sector);
+    *(uint32_t*)(fat_sector + (fat_offset % SECTOR_SIZE)) =
+        (*(uint32_t*)(fat_sector + (fat_offset % SECTOR_SIZE)) & 0xF0000000) |
+        (value & 0x0FFFFFFF);
+
+    bool success = read_write_sectors(g_ahci_port, sector_num, 1, true, fat_sector) == 0;
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Mirror to FAT2. The FAT32 spec says: if BPB_ExtFlags bit 7 is clear
+    // (the default), the FAT is mirrored — every update must hit FAT1 AND
+    // FAT2. Windows CHKDSK and Linux dosfsck both treat FAT1/FAT2 mismatch
+    // as filesystem corruption and may "repair" by overwriting the live
+    // FAT from the stale one. The old code wrote only FAT1, guaranteeing
+    // every file created by this OS looked corrupted to any other OS.
+    //
+    // If ext_flags bit 7 is set, only the FAT specified by bits 0-3 is
+    // active; honour that and skip the mirror.
+    // ─────────────────────────────────────────────────────────────────────
+    bool mirror_fats = (bpb.ext_flags & 0x0080) == 0;
+    if (success && mirror_fats && bpb.num_fats >= 2) {
+        uint32_t fat2_sector_num = fat_start_sector + bpb.fat_sz32 + fat_sector_index;
+        success = read_write_sectors(g_ahci_port, fat2_sector_num, 1, true, fat_sector) == 0;
+    }
+
+    delete[] fat_sector;
+    return success;
+}
+
+uint32_t find_free_cluster() {
+    uint32_t max_clusters = fat32_max_clusters();
+    for (uint32_t i = 2; i < max_clusters; i++) if (read_fat_entry(i) == FAT_FREE_CLUSTER) return i;
+    return 0;
+}
+
+uint32_t allocate_cluster() {
+    uint32_t free_cluster = find_free_cluster();
+    if (free_cluster != 0) write_fat_entry(free_cluster, FAT_END_OF_CHAIN);
+    return free_cluster;
+}
+
+void free_cluster_chain(uint32_t start_cluster) {
+    uint32_t current = start_cluster;
+    while(current < FAT_END_OF_CHAIN) { uint32_t next = read_fat_entry(current); write_fat_entry(current, FAT_FREE_CLUSTER); current = next; }
+}
+
+// Hinted free-cluster scan: starts from `start_from` instead of cluster 2.
+// allocate_cluster_chain uses this to avoid the O(N^2) cost of the original
+// "always scan from cluster 2" loop — that read the same FAT sectors over
+// and over (millions of redundant reads for a 1 MB file at 512-byte
+// clusters). Falls back to a full scan if nothing was found above the hint.
+static uint32_t find_free_cluster_hinted(uint32_t start_from) {
+    uint32_t max_clusters = fat32_max_clusters();
+    if (start_from < 2) start_from = 2;
+    for (uint32_t i = start_from; i < max_clusters; i++)
+        if (read_fat_entry(i) == FAT_FREE_CLUSTER) return i;
+    for (uint32_t i = 2; i < start_from && i < max_clusters; i++)
+        if (read_fat_entry(i) == FAT_FREE_CLUSTER) return i;
+    return 0;
+}
+
+uint32_t allocate_cluster_chain(uint32_t num_clusters) {
+    if(num_clusters == 0) return 0;
+    // Find the first free cluster (full scan, once).
+    uint32_t first = allocate_cluster();
+    if(first == 0) return 0;
+    uint32_t current = first;
+    // For the rest of the chain, scan FORWARD from the last cluster we
+    // grabbed — on a freshly-formatted disk the next free cluster is
+    // almost always current+1, which costs one FAT read per allocation
+    // instead of (number-allocated-so-far) FAT reads.
+    for(uint32_t i = 1; i < num_clusters; i++) {
+        uint32_t next = find_free_cluster_hinted(current + 1);
+        if(next == 0) { free_cluster_chain(first); return 0; }
+        write_fat_entry(next,    FAT_END_OF_CHAIN); // mark allocated
+        write_fat_entry(current, next);             // link previous → next
+        current = next;
+    }
+    return first;
+}
+
+bool read_data_from_clusters(uint32_t start_cluster, void* data, uint32_t size) {
+    if (size == 0) return true;
+    uint8_t* data_ptr = (uint8_t*)data;
+    uint32_t remaining = size;
+    uint32_t current_cluster = start_cluster;
+    uint32_t cluster_size = bpb.sec_per_clus * SECTOR_SIZE;
+
+    while (current_cluster >= 2 && current_cluster < FAT_END_OF_CHAIN && remaining > 0) {
+        uint32_t to_read = (remaining > cluster_size) ? cluster_size : remaining;
+        uint8_t* cluster_buf = new uint8_t[cluster_size];
+        memset(cluster_buf, 0, cluster_size); // Clear buffer
+        if(read_write_sectors(g_ahci_port, cluster_to_lba(current_cluster), bpb.sec_per_clus, false, cluster_buf) != 0) { 
+            delete[] cluster_buf; 
+            return false; 
+        }
+        memcpy(data_ptr, cluster_buf, to_read);
+        delete[] cluster_buf;
+        data_ptr += to_read;
+        remaining -= to_read;
+        if (remaining > 0) current_cluster = read_fat_entry(current_cluster);
+        else break;
+    }
+    return true;
+}
+
+bool write_data_to_clusters(uint32_t start_cluster, const void* data, uint32_t size) {
+    if (size == 0) return true;
+    const uint8_t* data_ptr = (const uint8_t*)data;
+    uint32_t remaining = size;
+    uint32_t current_cluster = start_cluster;
+    uint32_t cluster_size = bpb.sec_per_clus * SECTOR_SIZE;
+    uint8_t* cluster_buf = new uint8_t[cluster_size];
+
+    while (current_cluster >= 2 && current_cluster < FAT_END_OF_CHAIN && remaining > 0) {
+        uint32_t to_write = (remaining > cluster_size) ? cluster_size : remaining;
+        memset(cluster_buf, 0, cluster_size);
+        memcpy(cluster_buf, data_ptr, to_write);
+        if (read_write_sectors(g_ahci_port, cluster_to_lba(current_cluster), bpb.sec_per_clus, true, cluster_buf) != 0) { 
+            delete[] cluster_buf; 
+            return false; 
+        }
+        data_ptr += to_write;
+        remaining -= to_write;
+        if (remaining > 0) current_cluster = read_fat_entry(current_cluster);
+        else break;
+    }
+    delete[] cluster_buf;
+    return true;
+}
+
+uint32_t clusters_needed(uint32_t size) {
+    if (bpb.sec_per_clus == 0) return 0;
+    uint32_t cluster_size = bpb.sec_per_clus * SECTOR_SIZE;
+    return (size + cluster_size - 1) / cluster_size;
+}
+
+void fat32_list_files() {
+    if (!ahci_base || !current_directory_cluster) {
+        wm.print_to_focused("Filesystem not ready.\n");
+        return;
+    }
+    uint32_t cluster_bytes = bpb.sec_per_clus * SECTOR_SIZE;
+    uint8_t* buffer = new uint8_t[cluster_bytes];
+
+    wm.print_to_focused("Name                           Size\n");
+    char lfn_buf[256] = {0};
+
+    // FAT32 directories are ordinary cluster chains, not single clusters.
+    // Once enough entries exist to fill one cluster (trivially easy: a
+    // 512-byte cluster only holds 16 entries), the directory spills into
+    // a second, third, ... cluster via the FAT chain. The old code only
+    // ever read the FIRST cluster, so any files sitting in later clusters
+    // — very common right after copying a batch of files in from another
+    // OS — silently vanished from `ls`. We now walk the whole chain and
+    // only stop when we hit a genuine end-of-directory marker (name[0] ==
+    // 0x00), exactly like real FAT32 implementations do.
+    uint32_t cluster = current_directory_cluster;
+    bool end_of_dir = false;
+    while (!end_of_dir && cluster >= 2 && cluster < FAT_END_OF_CHAIN) {
+        if (read_write_sectors(g_ahci_port, cluster_to_lba(cluster), bpb.sec_per_clus, false, buffer) != 0) {
+            wm.print_to_focused("Read error\n");
+            break;
+        }
+
+        for (uint32_t i = 0; i < cluster_bytes; i += sizeof(fat_dir_entry_t)) {
+            fat_dir_entry_t* entry = (fat_dir_entry_t*)(buffer + i);
+
+            if (entry->name[0] == 0x00) { end_of_dir = true; break; }
+            if ((uint8_t)entry->name[0] == DELETED_ENTRY) {
+                lfn_buf[0] = '\0';
+                continue;
+            }
+            if (entry->name[0] == '.') continue;
+
+            if (entry->attr == ATTR_LONG_NAME) {
+                fat_lfn_entry_t* lfn = (fat_lfn_entry_t*)entry;
+                if (lfn->order & 0x40) lfn_buf[0] = '\0';
+
+                char name_part[14] = {0};
+                int k = 0;
+                auto extract = [&](uint16_t val) {
+                    if (k < 13 && val != 0x0000 && val != 0xFFFF) name_part[k++] = (char)val;
+                };
+                for(int j=0; j<5; j++) extract(lfn->name1[j]);
+                for(int j=0; j<6; j++) extract(lfn->name2[j]);
+                for(int j=0; j<2; j++) extract(lfn->name3[j]);
+
+                memmove(lfn_buf + k, lfn_buf, strlen(lfn_buf) + 1);
+                memcpy(lfn_buf, name_part, k);
+
+            } else if (!(entry->attr & ATTR_VOLUME_ID)) {
+                char line[120];
+                char fname_83[13];
+                const char* name_to_print;
+
+                if (lfn_buf[0] != '\0') {
+                    name_to_print = lfn_buf;
+                } else {
+                    from_83_format(entry->name, fname_83);
+                    name_to_print = fname_83;
+                }
+
+                // Manually copy and pad the filename to 30 characters
+                int name_len = strlen(name_to_print);
+                int copy_len = (name_len > 30) ? 30 : name_len;
+                memcpy(line, name_to_print, copy_len);
+                for (int k = copy_len; k < 30; ++k) {
+                    line[k] = ' ';
+                }
+                line[30] = '\0'; // Terminate after the padded name
+
+                // Directories show "<DIR>" instead of a size -- their
+                // file_size field is always 0, which used to make every
+                // folder look exactly like an empty file in the listing.
+                if (entry->attr & FAT_ATTR_DIRECTORY) {
+                    snprintf(line + 30, 90, " <DIR>\n");
+                } else {
+                    snprintf(line + 30, 90, " %d\n", entry->file_size);
+                }
+
+                wm.print_to_focused(line);
+                lfn_buf[0] = '\0'; // Reset for next entry
+            }
+        }
+
+        if (!end_of_dir) cluster = read_fat_entry(cluster);
+    }
+    delete[] buffer;
+}
+
+// ── LFN-aware directory entry creation ──────────────────────────────────
+//
+// BUG THIS SECTION FIXES ("filesystem > 8.3 misplacement"):
+// fat32_write_file() used to build ONLY an 8.3 short-name entry via
+// to_83_format() -- a naive first-8-chars/first-3-chars truncation with
+// NO collision numbering and NO accompanying long-file-name (LFN)
+// entries. fat32_find_entry() (used by ls/cd/cat/the Explorer/etc.) is
+// already LFN-aware and correctly resolves real VFAT LFN chains (e.g.
+// ones mtools writes when the Makefile injects a file) -- but any file
+// the KERNEL itself created or renamed with a name that didn't fit
+// cleanly in 8.3 got silently stored under a mangled short name with no
+// LFN pointing back to what was actually typed. Symptoms: saving a
+// file called "my_long_filename.txt" (or `cc`'s in-kernel output, or `mv` to a long
+// name) appears to succeed, but the file then shows up in `ls`/Explorer
+// under a garbled 8.3 name instead, and re-opening it by the name you
+// actually gave it fails ("not found") -- the file is, in effect,
+// misplaced under a name nobody asked for. Worse, two different long
+// names sharing the same 8-char prefix (e.g. "long_name_a.txt" and
+// "long_name_b.txt") both truncated to the SAME short name, so writing
+// the second silently created a duplicate/colliding short entry instead
+// of a distinct file.
+//
+// Fix: names that already fit 8.3 exactly (short, uppercase, single
+// dot, no spaces) are stored exactly as before -- untouched, byte-for-
+// byte compatible with every already-written disk image. Names that
+// don't get a real LFN chain (Windows/mtools-style "first 6 chars +
+// ~N" numeric-tail short name, collision-checked against the directory)
+// immediately followed by the short entry, which is exactly the layout
+// fat32_find_entry()'s existing LFN reader already expects.
+
+// True if `filename` can be stored as a short entry with NO LFN chain
+// needed: <=8 char base, <=3 char extension, exactly one dot (or none),
+// no spaces, and no lowercase letters (lowercase would silently become
+// uppercase on read-back without an LFN entry to preserve the real
+// casing -- see from_83_format()/to_83_format() above).
+static bool fat_short_name_fits_exactly(const char* filename) {
+    int i = 0, base_len = 0;
+    while (filename[i] && filename[i] != '.') {
+        char c = filename[i];
+        if (c == ' ' || (c >= 'a' && c <= 'z')) return false;
+        base_len++; i++;
+    }
+    if (base_len == 0 || base_len > 8) return false;
+    if (filename[i] == '.') {
+        i++;
+        int ext_len = 0;
+        while (filename[i]) {
+            char c = filename[i];
+            if (c == '.' || c == ' ' || (c >= 'a' && c <= 'z')) return false;
+            ext_len++; i++;
+        }
+        if (ext_len == 0 || ext_len > 3) return false;
+    }
+    return true;
+}
+
+// True if an 11-byte space-padded short name already exists anywhere in
+// dir_cluster's chain (LFN entries are skipped -- they aren't short
+// names). Used by fat_generate_short_name() below to pick a numeric
+// tail that doesn't collide with an existing file.
+static bool fat_short_name_exists(const char cand83[11], uint32_t dir_cluster) {
+    uint8_t* dir_buf = new uint8_t[SECTOR_SIZE];
+    uint32_t cluster = dir_cluster;
+    bool found = false;
+    while (!found && cluster >= 2 && cluster < FAT_END_OF_CHAIN) {
+        for (uint8_t s = 0; s < bpb.sec_per_clus && !found; s++) {
+            uint64_t sector_lba = cluster_to_lba(cluster) + s;
+            if (read_write_sectors(g_ahci_port, sector_lba, 1, false, dir_buf) != 0) continue;
+            for (uint16_t e = 0; e < SECTOR_SIZE / sizeof(fat_dir_entry_t); e++) {
+                fat_dir_entry_t* entry = (fat_dir_entry_t*)(dir_buf + e * sizeof(fat_dir_entry_t));
+                if (entry->name[0] == 0x00) break;
+                if ((uint8_t)entry->name[0] == DELETED_ENTRY) continue;
+                if (entry->attr == ATTR_LONG_NAME) continue;
+                if (memcmp(entry->name, cand83, 11) == 0) { found = true; break; }
+            }
+        }
+        cluster = read_fat_entry(cluster);
+    }
+    delete[] dir_buf;
+    return found;
+}
+
+// Builds a unique 8.3 short name for a `filename` that doesn't fit 8.3
+// exactly, using the standard "first N valid chars + ~digit" numeric
+// tail scheme (mirrors what mtools/Windows generate), checked against
+// the directory so two names with the same prefix never collide.
+static void fat_generate_short_name(const char* filename, uint32_t dir_cluster, char out83[11]) {
+    char base[9] = {0}, ext[4] = {0};
+    int i = 0, bi = 0;
+    while (filename[i] && filename[i] != '.' && bi < 8) {
+        char c = filename[i++];
+        if (c == ' ') continue;
+        base[bi++] = (c >= 'a' && c <= 'z') ? (char)(c - 32) : c;
+    }
+    if (bi == 0) { base[0] = '_'; bi = 1; } // pathological "leading dot" guard
+    while (filename[i] && filename[i] != '.') i++;
+    if (filename[i] == '.') {
+        i++;
+        int ei = 0;
+        while (filename[i] && ei < 3) {
+            char c = filename[i++];
+            if (c == ' ') continue;
+            ext[ei++] = (c >= 'a' && c <= 'z') ? (char)(c - 32) : c;
+        }
+    }
+    int ext_len = (int)strlen(ext);
+
+    for (int n = 1; n <= 999999; n++) {
+        char tail[8];
+        int tail_len = snprintf(tail, sizeof(tail), "~%d", n);
+        int keep = 8 - tail_len;
+        if (keep > bi) keep = bi;
+        if (keep < 1) keep = 1;
+
+        char cand[11];
+        memset(cand, ' ', 11);
+        memcpy(cand, base, keep);
+        memcpy(cand + keep, tail, tail_len);
+        memcpy(cand + 8, ext, ext_len);
+
+        if (!fat_short_name_exists(cand, dir_cluster)) {
+            memcpy(out83, cand, 11);
+            return;
+        }
+    }
+    to_83_format(filename, out83); // astronomically unlikely fallback
+}
+
+// Fills `total_slots` consecutive on-disk directory entries starting at
+// `out` with an LFN chain (if lfn_count > 0) followed by the short
+// entry. `out` need not be sector-aligned: callers point it at an
+// arbitrary in-buffer offset, including into a scratch buffer that
+// later gets split across two clusters (see fat_write_directory_entry
+// below, the cluster-boundary-straddling case).
+static void fat_build_entry_sequence(uint8_t* out, const char* filename, int name_len,
+                                      bool need_lfn, int lfn_count, uint8_t checksum,
+                                      const char short83[11],
+                                      uint32_t first_data_cluster, uint32_t size) {
+    int slot = 0;
+    if (need_lfn) {
+        // Highest sequence number first (order | 0x40 marks the LAST
+        // physical name chunk), immediately followed by the short
+        // entry -- exactly what fat32_find_entry()'s LFN reader (and
+        // any standard VFAT reader) expects.
+        for (int seq = lfn_count; seq >= 1; seq--) {
+            fat_lfn_entry_t* lfn = (fat_lfn_entry_t*)(out + slot * sizeof(fat_dir_entry_t));
+            memset(lfn, 0xFF, sizeof(fat_lfn_entry_t)); // unused chars pad to 0xFFFF
+            lfn->order       = (uint8_t)seq | (seq == lfn_count ? 0x40 : 0x00);
+            lfn->attr        = ATTR_LONG_NAME;
+            lfn->type        = 0;
+            lfn->checksum    = checksum;
+            lfn->fst_clus_lo = 0;
+
+            int base = (seq - 1) * 13;
+            uint16_t chars[13];
+            for (int k = 0; k < 13; k++) {
+                int idx = base + k;
+                if (idx < name_len)       chars[k] = (uint16_t)(unsigned char)filename[idx];
+                else if (idx == name_len) chars[k] = 0x0000;
+                else                      chars[k] = 0xFFFF;
+            }
+            for (int k = 0; k < 5; k++) lfn->name1[k] = chars[k];
+            for (int k = 0; k < 6; k++) lfn->name2[k] = chars[5 + k];
+            for (int k = 0; k < 2; k++) lfn->name3[k] = chars[11 + k];
+            slot++;
+        }
+    }
+
+    fat_dir_entry_t* short_entry = (fat_dir_entry_t*)(out + slot * sizeof(fat_dir_entry_t));
+    memset(short_entry, 0, sizeof(fat_dir_entry_t));
+    memcpy(short_entry->name, short83, 11);
+    short_entry->attr        = ATTR_ARCHIVE;
+    short_entry->file_size   = size;
+    short_entry->fst_clus_lo = first_data_cluster & 0xFFFF;
+    short_entry->fst_clus_hi = (first_data_cluster >> 16) & 0xFFFF;
+}
+
+// Zero-fills an already-allocated cluster on disk, so every never-yet-
+// used entry in it reads back as a proper 0x00 end-of-directory
+// terminator.
+static bool fat_zero_cluster(uint32_t cluster) {
+    uint32_t cluster_bytes = bpb.sec_per_clus * SECTOR_SIZE;
+    uint8_t* zero_buf = new uint8_t[cluster_bytes];
+    memset(zero_buf, 0, cluster_bytes);
+    bool ok = (read_write_sectors(g_ahci_port, cluster_to_lba(cluster), bpb.sec_per_clus, true, zero_buf) == 0);
+    delete[] zero_buf;
+    return ok;
+}
+
+// Writes filename's directory entry -- a short entry only if it fits
+// 8.3 exactly, otherwise a real LFN chain immediately followed by a
+// disambiguated short entry -- pointing at first_data_cluster/size.
+// This is the ONE place fat32_write_file() (and fat32_rename_file(),
+// via fat_delete_directory_entry() + a fresh call here) creates
+// directory entries, so the LFN logic only has to be right in a
+// single spot.
+//
+// PLACEMENT RULE (this is the part that's easy to get subtly wrong):
+// a name[0]==0x00 entry means "everything from here to the end of the
+// directory is unused" -- fat32_find_entry()/list_files() (and every
+// standard FAT32 reader, including mtools) STOP SCANNING the instant
+// they see one. So a new entry can only go:
+//   (a) into a run of DELETED_ENTRY (0xE5) holes found BEFORE the
+//       first 0x00 -- reusing space from a prior delete, which never
+//       touches the terminator at all, or
+//   (b) starting EXACTLY at the position of the first 0x00 -- never
+//       at some other free run found further along, even if one
+//       exists (e.g. in a later, still-empty cluster). Placing there
+//       instead would leave the real 0x00 stale, permanently hiding
+//       the new entry from every reader that stops at it.
+// If (b) doesn't leave enough contiguous room before the end of that
+// cluster, a fresh cluster is appended and the entry sequence is
+// allowed to straddle the boundary (clusters aren't a scanning
+// barrier the way a 0x00 entry is -- readers just follow the chain).
+static int fat_write_directory_entry(uint32_t dir_cluster, const char* filename,
+                                      uint32_t first_data_cluster, uint32_t size) {
+    char short83[11];
+    bool need_lfn = !fat_short_name_fits_exactly(filename);
+    if (need_lfn) fat_generate_short_name(filename, dir_cluster, short83);
+    else          to_83_format(filename, short83);
+
+    // Clamp to 128 chars (~10 LFN entries + short entry = 11 slots)
+    // so the straddling case below only ever has to deal with two
+    // clusters, never three or more.
+    int name_len = (int)strlen(filename);
+    if (name_len > 128) name_len = 128;
+    int lfn_count = need_lfn ? (name_len + 12) / 13 : 0;
+    int total_slots = lfn_count + 1;
+    uint8_t checksum = need_lfn ? lfn_checksum((const unsigned char*)short83) : 0;
+
+    const int entries_per_sector  = SECTOR_SIZE / sizeof(fat_dir_entry_t);
+    const int entries_per_cluster = entries_per_sector * bpb.sec_per_clus;
+    const uint32_t cluster_bytes  = bpb.sec_per_clus * SECTOR_SIZE;
+
+    // --- Single forward scan: look for a DELETED-hole run good enough
+    // to use (strategy (a) above), and separately remember exactly
+    // where the first 0x00 terminator is (for strategy (b)) in case no
+    // hole was big enough.
+    uint32_t hole_cluster = 0; uint64_t hole_sector_lba = 0; int hole_entry_in_sector = -1;
+    uint32_t end_cluster = 0; int end_entry_in_cluster = -1;
+    bool have_end = false;
+    {
+        uint8_t* dir_buf = new uint8_t[SECTOR_SIZE];
+        uint32_t cluster = dir_cluster;
+        while (!have_end && cluster >= 2 && cluster < FAT_END_OF_CHAIN) {
+            for (uint8_t s = 0; s < bpb.sec_per_clus && !have_end; s++) {
+                uint64_t sector_lba = cluster_to_lba(cluster) + s;
+                if (read_write_sectors(g_ahci_port, sector_lba, 1, false, dir_buf) != 0) continue;
+
+                int run = 0, run_start = -1;
+                for (int e = 0; e < entries_per_sector; e++) {
+                    fat_dir_entry_t* entry = (fat_dir_entry_t*)(dir_buf + e * sizeof(fat_dir_entry_t));
+                    if (entry->name[0] == 0x00) {
+                        have_end             = true;
+                        end_cluster          = cluster;
+                        end_entry_in_cluster = s * entries_per_sector + e;
+                        break;
+                    }
+                    if ((uint8_t)entry->name[0] == DELETED_ENTRY) {
+                        if (run == 0) run_start = e;
+                        run++;
+                        if (run >= total_slots && hole_entry_in_sector < 0) {
+                            hole_cluster         = cluster;
+                            hole_sector_lba      = sector_lba;
+                            hole_entry_in_sector = run_start;
+                        }
+                    } else {
+                        run = 0;
+                    }
+                }
+            }
+            if (!have_end) cluster = read_fat_entry(cluster);
+        }
+        delete[] dir_buf;
+    }
+
+    // Strategy (a): a deleted-entry hole was big enough -- use it.
+    if (hole_entry_in_sector >= 0) {
+        uint8_t* buf = new uint8_t[SECTOR_SIZE];
+        if (read_write_sectors(g_ahci_port, hole_sector_lba, 1, false, buf) != 0) { delete[] buf; return -1; }
+        fat_build_entry_sequence(buf + hole_entry_in_sector * sizeof(fat_dir_entry_t),
+                                  filename, name_len, need_lfn, lfn_count, checksum,
+                                  short83, first_data_cluster, size);
+        int rc = read_write_sectors(g_ahci_port, hole_sector_lba, 1, true, buf);
+        delete[] buf;
+        return rc;
+    }
+
+    if (!have_end) {
+        // Shouldn't normally happen -- clusters are always zero-
+        // initialized on allocation, so a 0x00 always exists somewhere
+        // -- but handle it defensively by growing a fresh cluster and
+        // writing at its very start.
+        uint32_t new_cluster = allocate_cluster();
+        if (new_cluster == 0) return -1;
+        if (!fat_zero_cluster(new_cluster)) { free_cluster_chain(new_cluster); return -1; }
+        uint32_t last = dir_cluster, c = dir_cluster;
+        while (c >= 2 && c < FAT_END_OF_CHAIN) { last = c; c = read_fat_entry(c); }
+        write_fat_entry(last, new_cluster);
+        write_fat_entry(new_cluster, FAT_END_OF_CHAIN);
+        end_cluster          = new_cluster;
+        end_entry_in_cluster = 0;
+    }
+
+    // Strategy (b): place starting exactly at the terminator.
+    int room_in_cluster = entries_per_cluster - end_entry_in_cluster;
+    if (room_in_cluster >= total_slots) {
+        // Fits entirely within the tail cluster -- operate on the
+        // whole cluster as one buffer so the sequence can straddle a
+        // SECTOR boundary within it (still fine; only cluster
+        // boundaries need the special handling below) without extra
+        // bookkeeping.
+        uint8_t* cbuf = new uint8_t[cluster_bytes];
+        if (read_write_sectors(g_ahci_port, cluster_to_lba(end_cluster), bpb.sec_per_clus, false, cbuf) != 0) {
+            delete[] cbuf; return -1;
+        }
+        fat_build_entry_sequence(cbuf + end_entry_in_cluster * sizeof(fat_dir_entry_t),
+                                  filename, name_len, need_lfn, lfn_count, checksum,
+                                  short83, first_data_cluster, size);
+        int rc = read_write_sectors(g_ahci_port, cluster_to_lba(end_cluster), bpb.sec_per_clus, true, cbuf);
+        delete[] cbuf;
+        return rc;
+    }
+
+    // Doesn't fit in what's left of the tail cluster: append a fresh
+    // cluster and let the sequence straddle the boundary. This MUST
+    // link directly onto end_cluster (the cluster that actually holds
+    // the terminator) and write starting at end_entry_in_cluster with
+    // zero gap -- any gap would recreate the exact "stale 0x00" bug
+    // this function exists to avoid, just at cluster granularity.
+    uint32_t new_cluster = allocate_cluster();
+    if (new_cluster == 0) return -1;
+    if (!fat_zero_cluster(new_cluster)) { free_cluster_chain(new_cluster); return -1; }
+    write_fat_entry(end_cluster, new_cluster);
+    write_fat_entry(new_cluster, FAT_END_OF_CHAIN);
+
+    uint8_t* cbuf1 = new uint8_t[cluster_bytes];
+    uint8_t* cbuf2 = new uint8_t[cluster_bytes];
+    bool read_ok = (read_write_sectors(g_ahci_port, cluster_to_lba(end_cluster), bpb.sec_per_clus, false, cbuf1) == 0) &&
+                   (read_write_sectors(g_ahci_port, cluster_to_lba(new_cluster), bpb.sec_per_clus, false, cbuf2) == 0);
+    if (!read_ok) { delete[] cbuf1; delete[] cbuf2; return -1; }
+
+    uint8_t* seq = new uint8_t[total_slots * sizeof(fat_dir_entry_t)];
+    fat_build_entry_sequence(seq, filename, name_len, need_lfn, lfn_count, checksum,
+                              short83, first_data_cluster, size);
+
+    int fits_in_cbuf1 = room_in_cluster; // < total_slots, guaranteed by the branch above
+    memcpy(cbuf1 + end_entry_in_cluster * sizeof(fat_dir_entry_t), seq,
+           fits_in_cbuf1 * sizeof(fat_dir_entry_t));
+    memcpy(cbuf2, seq + fits_in_cbuf1 * sizeof(fat_dir_entry_t),
+           (total_slots - fits_in_cbuf1) * sizeof(fat_dir_entry_t));
+    delete[] seq;
+
+    bool write_ok = (read_write_sectors(g_ahci_port, cluster_to_lba(end_cluster), bpb.sec_per_clus, true, cbuf1) == 0) &&
+                     (read_write_sectors(g_ahci_port, cluster_to_lba(new_cluster), bpb.sec_per_clus, true, cbuf2) == 0);
+    delete[] cbuf1;
+    delete[] cbuf2;
+    return write_ok ? 0 : -1;
+}
+
+// Deletes filename's directory entry (short name + any immediately-
+// preceding LFN chain) WITHOUT touching its data clusters. Split out
+// of fat32_remove_file() so fat32_rename_file() can reuse it to drop
+// the OLD entry while keeping the file's clusters alive for the new
+// entry fat_write_directory_entry() creates right after.
+static int fat_delete_directory_entry(const char* filename) {
+    fat_dir_entry_t entry;
+    uint32_t sector, offset;
+    if (fat32_find_entry(filename, &entry, &sector, &offset) != 0) return -1;
+
+    uint8_t* dir_buf = new uint8_t[SECTOR_SIZE];
+    if (read_write_sectors(g_ahci_port, sector, 1, false, dir_buf) != 0) { delete[] dir_buf; return -1; }
+
+    int idx = (int)(offset / sizeof(fat_dir_entry_t));
+    ((fat_dir_entry_t*)(dir_buf + idx * sizeof(fat_dir_entry_t)))->name[0] = DELETED_ENTRY;
+
+    // Walk backward over any LFN chain immediately preceding the short
+    // entry (fat_write_directory_entry() always writes them contiguous
+    // in the same sector, so this never has to cross a sector
+    // boundary) and mark those deleted too -- otherwise every
+    // long-named file left permanent orphaned LFN garbage behind.
+    for (int e = idx - 1; e >= 0; e--) {
+        fat_dir_entry_t* prev = (fat_dir_entry_t*)(dir_buf + e * sizeof(fat_dir_entry_t));
+        if (prev->attr != ATTR_LONG_NAME) break;
+        bool was_last_lfn = (((fat_lfn_entry_t*)prev)->order & 0x40) != 0;
+        prev->name[0] = DELETED_ENTRY;
+        if (was_last_lfn) break;
+    }
+
+    int rc = read_write_sectors(g_ahci_port, sector, 1, true, dir_buf);
+    delete[] dir_buf;
+    return rc;
+}
+
+int fat32_write_file(const char* filename, const void* data, uint32_t size) {
+    // First, safely remove the file if it already exists to handle overwrites correctly.
+    fat32_remove_file(filename);
+
+    uint32_t first_cluster = 0;
+
+    if (size > 0) {
+        uint32_t num_clusters = clusters_needed(size);
+        if (num_clusters == 0) return -1;
+        
+        first_cluster = allocate_cluster_chain(num_clusters);
+        if (first_cluster == 0) return -1; // Out of space
+        if (!write_data_to_clusters(first_cluster, data, size)) {
+            free_cluster_chain(first_cluster);
+            return -1; // Write error
+        }
+    }
+
+    int rc = fat_write_directory_entry(current_directory_cluster, filename, first_cluster, size);
+    if (rc != 0 && first_cluster > 0) free_cluster_chain(first_cluster);
+    return rc;
+}
+
+// Forward decl: fat32_find_entry() is defined just below, but
+// fat32_read_file_as_string() (next) needs to call it and C++ requires
+// the declaration to come first textually.
+int fat32_find_entry(const char* filename, fat_dir_entry_t* entry_out, uint32_t* sector_out, uint32_t* offset_out);
+
+char* fat32_read_file_as_string(const char* filename) {
+    // FIX (in-kernel `cc`'s #include "long_name.h" not found): this
+    // used to do its own directory scan comparing ONLY the flat 8.3
+    // short name -- to_83_format(filename) (a naive first-8-characters
+    // truncation) against each entry's raw 11-byte short name, with no
+    // long-file-name (LFN) awareness at all.
+    //
+    // That breaks for any name whose base is over 8 characters, e.g.
+    // "bochs_drivers.h": if the file reached disk.img via mtools
+    // mcopy (as `make cc`'s ELF injection and the documented dev
+    // workflow both do), mtools writes REAL VFAT LFN entries using the
+    // standard Windows "~1" collision-numbering scheme ("BOCHS_D~1.H"),
+    // which doesn't match this function's own from-scratch truncation
+    // ("BOCHS_DR.H") -- so a file that is genuinely, correctly on disk
+    // could still come back "not found" the moment its name didn't fit
+    // 8.3 cleanly. That's exactly the failure libtcc's preprocessor hit
+    // resolving #include "bochs_drivers.h" through this function (see
+    // tcc_kernel.cpp's open()).
+    //
+    // fat32_find_entry() (right below) already does this correctly: it
+    // parses real LFN entry chains AND falls back to short-name
+    // matching, and is the same lookup `cd`/`ls`/the File Explorer all
+    // rely on. Delegate to it instead of maintaining a second, weaker
+    // lookup that silently disagreed with it.
+    fat_dir_entry_t entry;
+    uint32_t sector, offset;
+    if (fat32_find_entry(filename, &entry, &sector, &offset) != 0) return nullptr;
+
+    uint32_t size = entry.file_size;
+    if (size == 0) { char* empty = new char[1]; empty[0] = '\0'; return empty; }
+
+    char* data = new char[size + 1];
+    uint32_t first_cluster = (entry.fst_clus_hi << 16) | entry.fst_clus_lo;
+    if (read_data_from_clusters(first_cluster, data, size)) {
+        data[size] = '\0';
+        return data;
+    }
+    delete[] data;
+    return nullptr;
+}
+
+int fat32_find_entry(const char* filename, fat_dir_entry_t* entry_out, uint32_t* sector_out, uint32_t* offset_out) {
+    char lfn_buf[256] = {0};
+    uint8_t current_checksum = 0;
+
+    // Walk the directory's FULL cluster chain, not just its first cluster.
+    // See the comment in fat32_list_files() for why this matters: any
+    // entry copied in from another OS that landed past cluster #1 used to
+    // be completely invisible to this lookup, which made "cp"/"cat"/open
+    // silently fail on files that clearly existed on disk.
+    uint8_t* dir_buf = new uint8_t[SECTOR_SIZE];
+    uint32_t cluster = current_directory_cluster;
+    while (cluster >= 2 && cluster < FAT_END_OF_CHAIN) {
+        for(uint8_t s=0; s<bpb.sec_per_clus; ++s) {
+            uint32_t current_sector = cluster_to_lba(cluster) + s;
+            if(read_write_sectors(g_ahci_port, current_sector, 1, false, dir_buf) != 0) {
+                delete[] dir_buf;
+                return -1;
+            }
+
+            for(uint16_t e=0; e < SECTOR_SIZE / sizeof(fat_dir_entry_t); ++e) {
+                fat_dir_entry_t* entry = (fat_dir_entry_t*)(dir_buf + e*sizeof(fat_dir_entry_t));
+                if(entry->name[0] == 0x00) { delete[] dir_buf; return -1; }
+                if((uint8_t)entry->name[0] == DELETED_ENTRY) { lfn_buf[0] = '\0'; continue; }
+
+                if(entry->attr == ATTR_LONG_NAME) {
+                    fat_lfn_entry_t* lfn = (fat_lfn_entry_t*)entry;
+                    if (lfn->order & 0x40) {
+                        lfn_buf[0] = '\0';
+                        current_checksum = lfn->checksum;
+                    }
+
+                    char name_part[14] = {0};
+                    int k = 0;
+                    auto extract = [&](uint16_t val) {
+                        if (k < 13 && val != 0x0000 && val != 0xFFFF) name_part[k++] = (char)val;
+                    };
+                    for(int j=0; j<5; j++) extract(lfn->name1[j]);
+                    for(int j=0; j<6; j++) extract(lfn->name2[j]);
+                    for(int j=0; j<2; j++) extract(lfn->name3[j]);
+
+                    memmove(lfn_buf + k, lfn_buf, strlen(lfn_buf) + 1);
+                    memcpy(lfn_buf, name_part, k);
+
+                } else if (!(entry->attr & ATTR_VOLUME_ID)) {
+                    bool match = false;
+                    if(lfn_buf[0] != '\0' && lfn_checksum((unsigned char*)entry->name) == current_checksum) {
+                        if(strcmp(lfn_buf, filename) == 0) match = true;
+                    } else {
+                        char sfn_name[13];
+                        from_83_format(entry->name, sfn_name);
+                        if(strcmp(sfn_name, filename) == 0) match = true;
+                    }
+
+                    lfn_buf[0] = '\0';
+
+                    if(match) {
+                        memcpy(entry_out, entry, sizeof(fat_dir_entry_t));
+                        *sector_out = current_sector;
+                        *offset_out = e * sizeof(fat_dir_entry_t);
+                        delete[] dir_buf;
+                        return 0;
+                    }
+                }
+            }
+        }
+        cluster = read_fat_entry(cluster);
+    }
+    delete[] dir_buf;
+    return -1;
+}
+// =============================================================================
+// DIRECTORY TRAVERSAL (cd / mkdir / path resolution)
+// =============================================================================
+// Everything above this point (fat32_find_entry, fat32_list_files, ...)
+// only ever looks inside current_directory_cluster -- the filesystem was
+// originally "one flat directory" with no way to descend into anything
+// else. The functions below generalise entry lookup to an arbitrary
+// starting cluster so the shell's `cd`, `mkdir`, the File Explorer, and
+// the in-kernel TCC compiler's #include resolution can all navigate
+// real subdirectories instead of being stuck at the root.
+
+// Same scan as fat32_find_entry(), but against an explicitly given
+// directory cluster instead of always current_directory_cluster, and
+// without the sector/offset out-params those callers use to edit an
+// entry in place (cd/mkdir/path-resolution only ever need to know
+// *what* an entry is, never to overwrite it).
+int fat32_find_entry_in(uint32_t dir_cluster, const char* name, fat_dir_entry_t* entry_out) {
+    char lfn_buf[256] = {0};
+    uint8_t current_checksum = 0;
+    uint8_t* dir_buf = new uint8_t[SECTOR_SIZE];
+    uint32_t cluster = dir_cluster;
+    while (cluster >= 2 && cluster < FAT_END_OF_CHAIN) {
+        for (uint8_t s = 0; s < bpb.sec_per_clus; ++s) {
+            uint32_t sector = cluster_to_lba(cluster) + s;
+            if (read_write_sectors(g_ahci_port, sector, 1, false, dir_buf) != 0) {
+                delete[] dir_buf;
+                return -1;
+            }
+            for (uint16_t e = 0; e < SECTOR_SIZE / sizeof(fat_dir_entry_t); ++e) {
+                fat_dir_entry_t* entry = (fat_dir_entry_t*)(dir_buf + e * sizeof(fat_dir_entry_t));
+                if (entry->name[0] == 0x00) { delete[] dir_buf; return -1; }
+                if ((uint8_t)entry->name[0] == DELETED_ENTRY) { lfn_buf[0] = '\0'; continue; }
+                if (entry->name[0] == '.') continue; // hide "." / ".." -- same as fat32_find_entry/list_files
+
+                if (entry->attr == ATTR_LONG_NAME) {
+                    fat_lfn_entry_t* lfn = (fat_lfn_entry_t*)entry;
+                    if (lfn->order & 0x40) {
+                        lfn_buf[0] = '\0';
+                        current_checksum = lfn->checksum;
+                    }
+                    char name_part[14] = {0};
+                    int k = 0;
+                    auto extract = [&](uint16_t val) {
+                        if (k < 13 && val != 0x0000 && val != 0xFFFF) name_part[k++] = (char)val;
+                    };
+                    for (int j=0; j<5; j++) extract(lfn->name1[j]);
+                    for (int j=0; j<6; j++) extract(lfn->name2[j]);
+                    for (int j=0; j<2; j++) extract(lfn->name3[j]);
+                    memmove(lfn_buf + k, lfn_buf, strlen(lfn_buf) + 1);
+                    memcpy(lfn_buf, name_part, k);
+                } else if (!(entry->attr & ATTR_VOLUME_ID)) {
+                    bool match = false;
+                    if (lfn_buf[0] != '\0' && lfn_checksum((unsigned char*)entry->name) == current_checksum) {
+                        if (strcmp(lfn_buf, name) == 0) match = true;
+                    } else {
+                        char sfn[13];
+                        from_83_format(entry->name, sfn);
+                        if (strcmp(sfn, name) == 0) match = true;
+                    }
+                    lfn_buf[0] = '\0';
+                    if (match) {
+                        memcpy(entry_out, entry, sizeof(fat_dir_entry_t));
+                        delete[] dir_buf;
+                        return 0;
+                    }
+                }
+            }
+        }
+        cluster = read_fat_entry(cluster);
+    }
+    delete[] dir_buf;
+    return -1;
+}
+
+// Reads a directory's own ".." entry (always the 2nd entry -- see
+// fat32_mkdir(), the only thing that creates directories, which always
+// lays them out "." then ".." first) to find its parent cluster. This
+// lets 'cd ..' / path resolution walk upward without keeping a separate
+// directory tree in memory: the on-disk ".." entry already IS that tree.
+bool fat32_get_parent_cluster(uint32_t dir_cluster, uint32_t* parent_out) {
+    if (dir_cluster == bpb.root_clus) { *parent_out = bpb.root_clus; return true; } // root is its own parent
+
+    uint8_t buf[SECTOR_SIZE];
+    if (read_write_sectors(g_ahci_port, cluster_to_lba(dir_cluster), 1, false, buf) != 0) return false;
+
+    fat_dir_entry_t* dotdot = (fat_dir_entry_t*)(buf + sizeof(fat_dir_entry_t));
+    if (dotdot->name[0] != '.' || dotdot->name[1] != '.') return false; // not a dir we created -- no ".." to trust
+
+    uint32_t cl = ((uint32_t)dotdot->fst_clus_hi << 16) | dotdot->fst_clus_lo;
+    if (cl == 0) cl = bpb.root_clus; // FAT32 convention: ".." pointing at root is stored as cluster 0
+    *parent_out = cl;
+    return true;
+}
+
+// Pops the last "/name" component off an absolute path string in place:
+// "/a/b/c" -> "/a/b", "/a" -> "/". Root ("/") has nothing to pop.
+static void path_pop_component(char* path) {
+    size_t len = strlen(path);
+    if (len <= 1) return; // already root
+    char* slash = strrchr(path, '/');
+    if (!slash) return;
+    if (slash == path) path[1] = '\0'; // pop back to root
+    else *slash = '\0';
+}
+
+// Appends "/name" onto an absolute path string in place, handling the
+// at-root case ("/" + "sub" -> "/sub", not "//sub").
+static void path_push_component(char* path, size_t path_bufsize, const char* name) {
+    size_t len = strlen(path);
+    bool at_root = (len == 1 && path[0] == '/');
+    if (!at_root && len + 1 < path_bufsize) {
+        path[len] = '/';
+        path[len + 1] = '\0';
+    }
+    strncat(path, name, path_bufsize - strlen(path) - 1);
+}
+
+// Resolves a "/"-separated path (absolute if it starts with '/',
+// otherwise relative to base_cluster/base_path) one component at a time:
+// "." stays put, ".." goes to the parent via fat32_get_parent_cluster(),
+// anything else is looked up via fat32_find_entry_in() and must be a
+// directory. On success, *out_cluster and out_path (an absolute path,
+// buffer of at least out_path_size bytes) are updated; on failure
+// (any component not found, or not a directory), returns false and
+// leaves both outputs untouched.
+//
+// Shared by: the shell's `cd` (relative to current_directory_cluster),
+// the File Explorer (always resolves an absolute path built from its own
+// per-window current_path), and the in-kernel TCC compiler's #include
+// resolution (fat32_read_file_as_string_path(), below).
+bool fat32_resolve_path(const char* path, uint32_t base_cluster, const char* base_path,
+                         uint32_t* out_cluster, char* out_path, size_t out_path_size,
+                         bool* out_not_a_dir = nullptr) {
+    if (out_not_a_dir) *out_not_a_dir = false;
+    if (!ahci_base || !bpb.root_clus) return false;
+    if (!path || !*path) {
+        *out_cluster = base_cluster;
+        strncpy(out_path, base_path, out_path_size - 1);
+        out_path[out_path_size - 1] = '\0';
+        return true;
+    }
+
+    uint32_t cluster;
+    char work_path[256];
+    const char* p = path;
+    if (*p == '/') {
+        cluster = bpb.root_clus;
+        strncpy(work_path, "/", sizeof(work_path));
+        while (*p == '/') p++;
+    } else {
+        cluster = base_cluster;
+        strncpy(work_path, base_path, sizeof(work_path) - 1);
+        work_path[sizeof(work_path) - 1] = '\0';
+    }
+
+    char path_copy[256];
+    strncpy(path_copy, p, sizeof(path_copy) - 1);
+    path_copy[sizeof(path_copy) - 1] = '\0';
+
+    // Hand-rolled tokenizer (no strtok in this freestanding libc): walk
+    // path_copy in place, splitting on '/' and skipping empty components
+    // (so "a//b" and "a/b/" behave like a normal shell would).
+    char* comp = path_copy;
+    while (*comp) {
+        while (*comp == '/') comp++;
+        if (!*comp) break;
+        char* end = comp;
+        while (*end && *end != '/') end++;
+        bool at_end = (*end == '\0');
+        *end = '\0';
+
+        if (strcmp(comp, ".") == 0) {
+            // stay
+        } else if (strcmp(comp, "..") == 0) {
+            uint32_t parent;
+            if (!fat32_get_parent_cluster(cluster, &parent)) return false;
+            cluster = parent;
+            path_pop_component(work_path);
+        } else {
+            fat_dir_entry_t entry;
+            if (fat32_find_entry_in(cluster, comp, &entry) != 0) return false;
+            if (!(entry.attr & FAT_ATTR_DIRECTORY)) {
+                if (out_not_a_dir) *out_not_a_dir = true;
+                return false;
+            }
+            uint32_t next = ((uint32_t)entry.fst_clus_hi << 16) | entry.fst_clus_lo;
+            if (next == 0) next = bpb.root_clus;
+            cluster = next;
+            path_push_component(work_path, sizeof(work_path), comp);
+        }
+
+        if (at_end) break;
+        comp = end + 1;
+    }
+
+    *out_cluster = cluster;
+    strncpy(out_path, work_path, out_path_size - 1);
+    out_path[out_path_size - 1] = '\0';
+    return true;
+}
+
+// Creates a subdirectory named `name` inside current_directory_cluster.
+// Lays out the new cluster with "." (self) and ".." (parent) entries
+// first, exactly like a real FAT32 driver, so fat32_get_parent_cluster()
+// / 'cd ..' work on it afterward. Reuses fat32_write_file()'s existing
+// free-slot-scan-and-grow logic to insert the directory entry itself
+// (as a zero-length "file") rather than duplicating that code, then
+// patches the freshly-written entry's attribute/cluster in place.
+int fat32_mkdir(const char* name) {
+    if (!ahci_base || !current_directory_cluster || !name || !*name) return -1;
+
+    fat_dir_entry_t existing;
+    if (fat32_find_entry_in(current_directory_cluster, name, &existing) == 0) return -1; // name in use
+
+    uint32_t new_cluster = allocate_cluster();
+    if (new_cluster == 0) return -1;
+
+    uint32_t cluster_bytes = bpb.sec_per_clus * SECTOR_SIZE;
+    uint8_t* buf = new uint8_t[cluster_bytes];
+    memset(buf, 0, cluster_bytes);
+
+    fat_dir_entry_t* dot = (fat_dir_entry_t*)buf;
+    memset(dot->name, ' ', 11);
+    dot->name[0] = '.';
+    dot->attr = FAT_ATTR_DIRECTORY;
+    dot->fst_clus_lo = new_cluster & 0xFFFF;
+    dot->fst_clus_hi = (new_cluster >> 16) & 0xFFFF;
+
+    fat_dir_entry_t* dotdot = (fat_dir_entry_t*)(buf + sizeof(fat_dir_entry_t));
+    memset(dotdot->name, ' ', 11);
+    dotdot->name[0] = '.'; dotdot->name[1] = '.';
+    dotdot->attr = FAT_ATTR_DIRECTORY;
+    // FAT32 convention: ".." in a directory whose parent IS the root
+    // stores cluster 0, not the root cluster number.
+    uint32_t parent_stored = (current_directory_cluster == bpb.root_clus) ? 0 : current_directory_cluster;
+    dotdot->fst_clus_lo = parent_stored & 0xFFFF;
+    dotdot->fst_clus_hi = (parent_stored >> 16) & 0xFFFF;
+
+    write_fat_entry(new_cluster, FAT_END_OF_CHAIN);
+    bool wrote_ok = (read_write_sectors(g_ahci_port, cluster_to_lba(new_cluster), bpb.sec_per_clus, true, buf) == 0);
+    delete[] buf;
+    if (!wrote_ok) { free_cluster_chain(new_cluster); return -1; }
+
+    if (fat32_write_file(name, nullptr, 0) != 0) {
+        free_cluster_chain(new_cluster);
+        return -1;
+    }
+
+    fat_dir_entry_t written;
+    uint32_t sector, offset;
+    if (fat32_find_entry(name, &written, &sector, &offset) != 0) {
+        free_cluster_chain(new_cluster);
+        return -1;
+    }
+    uint8_t* sec_buf = new uint8_t[SECTOR_SIZE];
+    if (read_write_sectors(g_ahci_port, sector, 1, false, sec_buf) == 0) {
+        fat_dir_entry_t* e = (fat_dir_entry_t*)(sec_buf + offset);
+        e->attr = FAT_ATTR_DIRECTORY;
+        e->file_size = 0;
+        e->fst_clus_lo = new_cluster & 0xFFFF;
+        e->fst_clus_hi = (new_cluster >> 16) & 0xFFFF;
+        read_write_sectors(g_ahci_port, sector, 1, true, sec_buf);
+    }
+    delete[] sec_buf;
+    return 0;
+}
+
+// Path-aware counterpart to fat32_read_file_as_string(): that function
+// (and fat32_find_entry(), which it's built on) only ever searches
+// current_directory_cluster and treats any '/' in its argument as
+// (garbage) part of a flat 8.3 name. This splits off a leading
+// directory path -- if any -- resolves it via fat32_resolve_path(), and
+// only then does the plain current-directory lookup for the final
+// component. Used by the in-kernel TCC compiler so both `cc <path>` and
+// `#include "sub/dir/foo.h"` can reach a header that lives in a
+// subdirectory rather than only ever the flat root.
+char* fat32_read_file_as_string_path(const char* path) {
+    if (!path || !*path) return nullptr;
+
+    const char* last_slash = strrchr(path, '/');
+    if (!last_slash) return fat32_read_file_as_string(path); // no directory component -- unchanged behaviour
+
+    const char* file_part = last_slash + 1;
+    if (!*file_part) return nullptr; // path ended in '/' -- not a file
+
+    size_t dir_len = (size_t)(last_slash - path);
+    char dir_part[256];
+    if (dir_len == 0) {
+        strncpy(dir_part, "/", sizeof(dir_part));
+    } else {
+        if (dir_len >= sizeof(dir_part)) dir_len = sizeof(dir_part) - 1;
+        memcpy(dir_part, path, dir_len);
+        dir_part[dir_len] = '\0';
+    }
+
+    uint32_t dir_cluster;
+    char resolved_path[256];
+    if (!fat32_resolve_path(dir_part, current_directory_cluster, current_directory_path,
+                             &dir_cluster, resolved_path, sizeof(resolved_path))) {
+        return nullptr;
+    }
+
+    // Borrow the global "current directory" for one lookup rather than
+    // duplicating fat32_read_file_as_string()'s cluster-chain-walking
+    // read logic here. Single-threaded kernel, no reentrancy concern.
+    uint32_t saved_cluster = current_directory_cluster;
+    current_directory_cluster = dir_cluster;
+    char* result = fat32_read_file_as_string(file_part);
+    current_directory_cluster = saved_cluster;
+    return result;
+}
+
+// Splits `path` into a directory part (resolved to a cluster, via
+// fat32_resolve_path) and a final filename part. Shared by
+// fat32_find_entry_path()/fat32_write_file_path() below; kept as a
+// standalone helper (rather than reusing fat32_resolve_src(), defined
+// later, after fat32_rename_file()) purely to avoid a forward
+// declaration -- the logic is intentionally identical to
+// fat32_read_file_as_string_path()'s own split above.
+static bool fat32_split_and_resolve_dir(const char* path, uint32_t* dir_cluster_out,
+                                         char* file_part_out, size_t file_part_out_size) {
+    const char* last_slash = strrchr(path, '/');
+    if (!last_slash) {
+        *dir_cluster_out = current_directory_cluster;
+        strncpy(file_part_out, path, file_part_out_size - 1);
+        file_part_out[file_part_out_size - 1] = '\0';
+        return true;
+    }
+
+    const char* file_part = last_slash + 1;
+    if (!*file_part) return false; // path ended in '/' -- not a file
+
+    size_t dir_len = (size_t)(last_slash - path);
+    char dir_part[256];
+    if (dir_len == 0) {
+        strncpy(dir_part, "/", sizeof(dir_part));
+    } else {
+        if (dir_len >= sizeof(dir_part)) dir_len = sizeof(dir_part) - 1;
+        memcpy(dir_part, path, dir_len);
+        dir_part[dir_len] = '\0';
+    }
+
+    char resolved_path[256];
+    if (!fat32_resolve_path(dir_part, current_directory_cluster, current_directory_path,
+                             dir_cluster_out, resolved_path, sizeof(resolved_path))) {
+        return false;
+    }
+    strncpy(file_part_out, file_part, file_part_out_size - 1);
+    file_part_out[file_part_out_size - 1] = '\0';
+    return true;
+}
+
+// Path-aware fat32_find_entry(): resolves a directory-qualified path
+// ("sub/dir/foo.elf") instead of only ever looking in
+// current_directory_cluster. Needed so `bochs`/ELF execution can find a
+// file the File Explorer is showing from inside a subdirectory -- before
+// this, load_and_execute_elf() looked the file up in whatever directory
+// the SHELL happened to be in, which silently diverges from whatever
+// folder an Explorer window is actually displaying.
+int fat32_find_entry_path(const char* path, fat_dir_entry_t* entry_out) {
+    if (!path || !*path) return -1;
+    uint32_t dir_cluster;
+    char name[128];
+    if (!fat32_split_and_resolve_dir(path, &dir_cluster, name, sizeof(name))) return -1;
+
+    uint32_t saved_cluster = current_directory_cluster;
+    current_directory_cluster = dir_cluster;
+    uint32_t sector, offset;
+    int found = fat32_find_entry(name, entry_out, &sector, &offset);
+    current_directory_cluster = saved_cluster;
+    return found;
+}
+
+// Path-aware fat32_write_file(): lets the editor save back to whatever
+// subdirectory a file was opened from, instead of always writing into
+// the shell's current directory regardless of where the file actually
+// came from.
+int fat32_write_file_path(const char* path, const void* data, uint32_t size) {
+    if (!path || !*path) return -1;
+    uint32_t dir_cluster;
+    char name[128];
+    if (!fat32_split_and_resolve_dir(path, &dir_cluster, name, sizeof(name))) return -1;
+
+    uint32_t saved_cluster = current_directory_cluster;
+    current_directory_cluster = dir_cluster;
+    int result = fat32_write_file(name, data, size);
+    current_directory_cluster = saved_cluster;
+    return result;
+}
+
+// Guest-disk-wrapper helper (see bochs_glue.cpp's bochs_guest_disk_cmd):
+// get a file's size without reading its contents. Used both for the
+// guest's STAT command and internally by READ, so a too-small buffer
+// fails fast (with the real size reported back) instead of paying for
+// a full fat32_read_file_as_string() alloc+copy first.
+int fat32_stat_file(const char* filename, uint32_t* size_out) {
+    fat_dir_entry_t entry;
+    uint32_t sector, offset;
+    if (fat32_find_entry(filename, &entry, &sector, &offset) != 0) return -1;
+    if (size_out) *size_out = entry.file_size;
+    return 0;
+}
+
+int fat32_list_directory(const char* path, fat_dir_entry_t* buffer, int max_entries) {
+    if (!ahci_base || !bpb.root_clus || !buffer) {
+        return 0;
+    }
+
+    // 'path' is always treated as absolute (from root) here -- the File
+    // Explorer's current_path always starts "/" and is kept absolute by
+    // navigate_up()/navigate_into() -- so it resolves independently of
+    // whatever directory the shell's `cd` currently happens to be in.
+    // This used to ignore 'path' entirely and always list
+    // current_directory_cluster, which is why every FileExplorerWindow
+    // (even ones opened on a subfolder) silently showed the root.
+    uint32_t list_cluster;
+    char resolved[256];
+    if (!fat32_resolve_path(path, bpb.root_clus, "/", &list_cluster, resolved, sizeof(resolved))) {
+        return 0;
+    }
+
+    uint32_t cluster_bytes = bpb.sec_per_clus * SECTOR_SIZE;
+    uint8_t* dir_sector_buf = new uint8_t[cluster_bytes];
+
+    int count = 0;
+    // Walk the full directory cluster chain (see fat32_list_files() for
+    // why: entries past the first cluster used to be invisible here too,
+    // which is why file explorer / desktop icon lists silently dropped
+    // files copied in from another OS).
+    uint32_t cluster = list_cluster;
+    bool end_of_dir = false;
+    while (!end_of_dir && count < max_entries && cluster >= 2 && cluster < FAT_END_OF_CHAIN) {
+        if (read_write_sectors(g_ahci_port, cluster_to_lba(cluster), bpb.sec_per_clus, false, dir_sector_buf) != 0) {
+            break; // Read error
+        }
+
+        for (uint32_t i = 0; i < cluster_bytes; i += sizeof(fat_dir_entry_t)) {
+            if (count >= max_entries) break;
+
+            fat_dir_entry_t* entry = (fat_dir_entry_t*)(dir_sector_buf + i);
+
+            if (entry->name[0] == 0x00) { end_of_dir = true; break; } // End of directory
+            if ((uint8_t)entry->name[0] == DELETED_ENTRY) continue; // Skip deleted entries
+            if (entry->attr == ATTR_LONG_NAME || (entry->attr & ATTR_VOLUME_ID)) continue; // Skip LFN and Volume ID
+
+            // This is a valid file or directory, so copy it to the output buffer
+            memcpy(&buffer[count], entry, sizeof(fat_dir_entry_t));
+            count++;
+        }
+
+        if (!end_of_dir) cluster = read_fat_entry(cluster);
+    }
+
+    delete[] dir_sector_buf;
+    return count;
+}
+int fat32_remove_file(const char* filename) {
+    fat_dir_entry_t entry;
+    uint32_t sector, offset;
+    if(fat32_find_entry(filename, &entry, &sector, &offset) != 0) return -1;
+    uint32_t start_cluster = (entry.fst_clus_hi << 16) | entry.fst_clus_lo;
+
+    // fat_delete_directory_entry() (defined above, next to
+    // fat_write_directory_entry()) removes the short entry AND any LFN
+    // chain immediately preceding it -- plain 8.3 names have no such
+    // chain and are unaffected, so this is a strict superset of what
+    // this function used to do inline.
+    if (fat_delete_directory_entry(filename) != 0) return -1;
+    if (start_cluster != 0) free_cluster_chain(start_cluster);
+    return 0;
+}
+// ADD THIS NEW FUNCTION after fat32_rename_file
+int fat32_copy_file(const char* src_path, const char* dest_path) {
+    fat_dir_entry_t entry;
+    uint32_t sector, offset;
+
+    // 1. Find the source file and get its info
+    if (fat32_find_entry(src_path, &entry, &sector, &offset) != 0) {
+        return -1; // Source file not found
+    }
+
+    if (entry.file_size == 0) {
+        // Handle zero-byte files
+        return fat32_write_file(dest_path, nullptr, 0);
+    }
+    
+    // 2. Allocate memory and read the source file's content
+    uint8_t* content_buffer = new uint8_t[entry.file_size];
+    if (!content_buffer) {
+        return -2; // Out of memory
+    }
+
+    uint32_t start_cluster = (entry.fst_clus_hi << 16) | entry.fst_clus_lo;
+    if (!read_data_from_clusters(start_cluster, content_buffer, entry.file_size)) {
+        delete[] content_buffer;
+        return -3; // Failed to read source file
+    }
+
+    // 3. Write the content to the destination file
+    int result = fat32_write_file(dest_path, content_buffer, entry.file_size);
+    
+    delete[] content_buffer;
+    return (result == 0) ? 0 : -4; // Return 0 on success, else write error
+}
+int fat32_rename_file(const char* old_name, const char* new_name) {
+    fat_dir_entry_t entry;
+    uint32_t sector, offset;
+    fat_dir_entry_t dummy_entry;
+    uint32_t dummy_sector, dummy_offset;
+
+    // 1. Check if new_name already exists. If so, fail.
+    if (fat32_find_entry(new_name, &dummy_entry, &dummy_sector, &dummy_offset) == 0) {
+        return -1; // Destination file already exists
+    }
+
+    // 2. Find the old file. If it doesn't exist, fail.
+    if (fat32_find_entry(old_name, &entry, &sector, &offset) != 0) {
+        return -1; // Source file not found
+    }
+
+    // 3. Drop the OLD entry (short name + any LFN chain -- see
+    //    fat_delete_directory_entry()) WITHOUT freeing its data
+    //    clusters, then create a fresh entry for new_name pointing at
+    //    those same clusters.
+    //
+    //    This replaces the old approach of patching the 11-byte short
+    //    name field in place, which never touched the LFN chain: a
+    //    rename TO a long name silently truncated it into a mangled
+    //    short name with no LFN (the exact "misplacement" bug
+    //    fat_write_directory_entry() exists to fix), and a rename AWAY
+    //    from one left the old LFN chain behind as permanent directory
+    //    garbage.
+    uint32_t first_cluster = (entry.fst_clus_hi << 16) | entry.fst_clus_lo;
+    uint32_t size = entry.file_size;
+
+    if (fat_delete_directory_entry(old_name) != 0) return -1;
+    return fat_write_directory_entry(current_directory_cluster, new_name, first_cluster, size);
+}
+
+// =============================================================================
+// DIRECTORY-AWARE cp / mv
+// =============================================================================
+// fat32_copy_file()/fat32_rename_file() above (and the old `cp`/`mv` shell
+// handlers) only ever read/wrote current_directory_cluster -- there was no
+// way to copy or move a file into, out of, or between subdirectories. The
+// functions below add that, and also implement the standard cp/mv
+// convention that copying/moving onto an *existing directory* name places
+// the file inside it under its own name, e.g. `cp disk_tcc test` ->
+// test/disk_tcc, rather than trying to create/overwrite a file literally
+// named "test".
+
+// POSIX dirname()+basename() in one pass, writing into caller buffers
+// instead of returning pointers into a mutable copy. No trailing slash
+// -> dir_out is empty (caller's cue to mean "current directory").
+static void path_split_last(const char* path, char* dir_out, size_t dir_out_size,
+                             char* name_out, size_t name_out_size) {
+    const char* last_slash = strrchr(path, '/');
+    if (!last_slash) {
+        dir_out[0] = '\0';
+        strncpy(name_out, path, name_out_size - 1);
+        name_out[name_out_size - 1] = '\0';
+        return;
+    }
+    size_t dir_len = (size_t)(last_slash - path);
+    if (dir_len == 0) {
+        strncpy(dir_out, "/", dir_out_size);
+    } else {
+        if (dir_len >= dir_out_size) dir_len = dir_out_size - 1;
+        memcpy(dir_out, path, dir_len);
+        dir_out[dir_len] = '\0';
+    }
+    strncpy(name_out, last_slash + 1, name_out_size - 1);
+    name_out[name_out_size - 1] = '\0';
+}
+
+// Resolves a cp/mv source argument to (directory cluster, final name).
+static bool fat32_resolve_src(const char* src_path, uint32_t* dir_cluster_out,
+                               char* name_out, size_t name_out_size) {
+    char dir_part[256], name_part[128];
+    path_split_last(src_path, dir_part, sizeof(dir_part), name_part, sizeof(name_part));
+    if (name_part[0] == '\0') return false; // path ended in '/' -- not a file
+
+    if (dir_part[0] == '\0') {
+        *dir_cluster_out = current_directory_cluster;
+    } else {
+        char resolved[256];
+        if (!fat32_resolve_path(dir_part, current_directory_cluster, current_directory_path,
+                                 dir_cluster_out, resolved, sizeof(resolved))) {
+            return false;
+        }
+    }
+    strncpy(name_out, name_part, name_out_size - 1);
+    name_out[name_out_size - 1] = '\0';
+    return true;
+}
+
+// Resolves a cp/mv destination argument to (directory cluster, final
+// name), applying the "lands inside an existing directory under its own
+// name" convention:
+//   cp foo.txt existing_dir        -> existing_dir/foo.txt
+//   cp foo.txt existing_dir/       -> existing_dir/foo.txt
+//   cp foo.txt existing_dir/bar.c  -> existing_dir/bar.c
+//   cp foo.txt bar.c               -> ./bar.c  (original plain behavior)
+// `fallback_name` is the source's own filename, used whenever dest turns
+// out to name a directory rather than a new filename.
+static bool fat32_resolve_dest(const char* dest_path, const char* fallback_name,
+                                uint32_t* dir_cluster_out, char* name_out, size_t name_out_size) {
+    char dir_part[256], name_part[128];
+    path_split_last(dest_path, dir_part, sizeof(dir_part), name_part, sizeof(name_part));
+
+    uint32_t dir_cluster;
+    if (dir_part[0] == '\0') {
+        dir_cluster = current_directory_cluster;
+    } else {
+        char resolved[256];
+        if (!fat32_resolve_path(dir_part, current_directory_cluster, current_directory_path,
+                                 &dir_cluster, resolved, sizeof(resolved))) {
+            return false;
+        }
+    }
+
+    if (name_part[0] == '\0') {
+        // Trailing slash ("existing_dir/") -- keep the source's name.
+        *dir_cluster_out = dir_cluster;
+        strncpy(name_out, fallback_name, name_out_size - 1);
+        name_out[name_out_size - 1] = '\0';
+        return true;
+    }
+
+    // Does name_part itself name an existing directory inside
+    // dir_cluster? If so, descend into it and keep the source's name --
+    // this is what makes `cp disk_tcc test` land at test/disk_tcc
+    // instead of creating/overwriting a file literally called "test".
+    fat_dir_entry_t maybe_dir;
+    if (fat32_find_entry_in(dir_cluster, name_part, &maybe_dir) == 0 &&
+        (maybe_dir.attr & FAT_ATTR_DIRECTORY)) {
+        uint32_t sub = ((uint32_t)maybe_dir.fst_clus_hi << 16) | maybe_dir.fst_clus_lo;
+        if (sub == 0) sub = bpb.root_clus;
+        *dir_cluster_out = sub;
+        strncpy(name_out, fallback_name, name_out_size - 1);
+        name_out[name_out_size - 1] = '\0';
+        return true;
+    }
+
+    *dir_cluster_out = dir_cluster;
+    strncpy(name_out, name_part, name_out_size - 1);
+    name_out[name_out_size - 1] = '\0';
+    return true;
+}
+
+// Directory-aware file copy: resolves directory components on both sides
+// (see fat32_resolve_src()/fat32_resolve_dest() above) instead of only
+// ever touching current_directory_cluster. Whole directories can't be
+// copied this way, only regular files.
+int fat32_copy_file_path(const char* src_path, const char* dest_path) {
+    if (!ahci_base || !bpb.root_clus) return -1;
+
+    char src_name[128];
+    uint32_t src_dir_cluster;
+    if (!fat32_resolve_src(src_path, &src_dir_cluster, src_name, sizeof(src_name))) return -1;
+
+    uint32_t saved_cluster = current_directory_cluster;
+    current_directory_cluster = src_dir_cluster;
+    fat_dir_entry_t entry;
+    uint32_t sector, offset;
+    int found = fat32_find_entry(src_name, &entry, &sector, &offset);
+    current_directory_cluster = saved_cluster;
+    if (found != 0) return -1;
+    if (entry.attr & FAT_ATTR_DIRECTORY) return -1; // copying whole directories isn't supported
+
+    char* content = nullptr;
+    bool ok = true;
+    if (entry.file_size > 0) {
+        content = new char[entry.file_size];
+        ok = read_data_from_clusters((entry.fst_clus_hi << 16) | entry.fst_clus_lo, content, entry.file_size);
+    }
+    if (!ok) { delete[] content; return -1; }
+
+    char dest_name[128];
+    uint32_t dest_dir_cluster;
+    if (!fat32_resolve_dest(dest_path, src_name, &dest_dir_cluster, dest_name, sizeof(dest_name))) {
+        delete[] content;
+        return -1;
+    }
+
+    saved_cluster = current_directory_cluster;
+    current_directory_cluster = dest_dir_cluster;
+    int wrote = fat32_write_file(dest_name, content, entry.file_size);
+    current_directory_cluster = saved_cluster;
+
+    delete[] content;
+    return wrote;
+}
+
+// Directory-aware move: a fast in-place rename (identical to the
+// original fat32_rename_file() behavior) whenever both sides are plain,
+// same-directory names and the destination doesn't itself already name a
+// directory to move INTO; otherwise falls back to copy-then-delete-the-
+// original, which naturally supports crossing directories in either
+// direction.
+int fat32_move_file_path(const char* src_path, const char* dest_path) {
+    if (!strchr(src_path, '/') && !strchr(dest_path, '/')) {
+        fat_dir_entry_t maybe_dir;
+        bool dest_is_dir = (fat32_find_entry_in(current_directory_cluster, dest_path, &maybe_dir) == 0)
+                            && (maybe_dir.attr & FAT_ATTR_DIRECTORY);
+        if (!dest_is_dir) {
+            return fat32_rename_file(src_path, dest_path);
+        }
+    }
+
+    if (fat32_copy_file_path(src_path, dest_path) != 0) return -1;
+
+    char src_name[128];
+    uint32_t src_dir_cluster;
+    if (!fat32_resolve_src(src_path, &src_dir_cluster, src_name, sizeof(src_name))) return -1;
+
+    uint32_t saved_cluster = current_directory_cluster;
+    current_directory_cluster = src_dir_cluster;
+    int removed = fat32_remove_file(src_name);
+    current_directory_cluster = saved_cluster;
+    return removed;
+}
+
+void fat32_format() {
+    if(!ahci_base) {
+        wm.print_to_focused("AHCI disk not found. Cannot format.\n");
+        return;
+    }
+    wm.print_to_focused("WARNING: This is a destructive operation!\nFormatting disk...\n");
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Decide partition layout upfront.
+    //
+    // On a raw disk (g_partition_lba == 0) we will write an MBR and place
+    // the FAT32 partition at PART_START_LBA (2048 = 1 MiB, the standard
+    // alignment used by fdisk/parted/mkfs.fat).  On a pre-partitioned disk
+    // we format in-place at g_partition_lba.
+    //
+    // IMPORTANT: tot_sec32 in the BPB is the sector count OF THE PARTITION,
+    // not the whole disk.  Windows fastfat validates:
+    //   cluster_count = (tot_sec32 - rsvd_sec_cnt - num_fats*fat_sz32)
+    //                   / sec_per_clus
+    // and requires cluster_count >= 65525 for FAT32.  Using the whole-disk
+    // sector count here inflates the number and causes chkdsk to report
+    // "The volume size is too big" or refuse to mount on small images.
+    // ─────────────────────────────────────────────────────────────────────
+    const uint32_t PART_START_LBA = 2048;   // 1 MiB boundary (standard)
+    const bool raw_disk = (g_partition_lba == 0);
+
+    // Effective partition start that will end up in g_partition_lba after format.
+    const uint64_t new_part_lba = raw_disk ? PART_START_LBA : g_partition_lba;
+
+    // Total disk size in sectors. This used to be hardcoded to a 128 MB
+    // image's sector count regardless of what disk was actually attached
+    // -- fine for the test image this was originally developed against,
+    // but on real hardware it silently limited every format to the first
+    // 128 MB of the drive no matter how large it actually was. Query the
+    // real capacity via ATA IDENTIFY DEVICE first; only fall back to the
+    // old 128 MB constant if that query fails (e.g. some virtual disks
+    // that don't answer IDENTIFY the way real hardware does).
+    uint64_t identified_sectors = 0;
+    uint32_t disk_total_sectors = (128u * 1024u * 1024u) / 512u;
+    if (ahci_get_disk_total_sectors(g_ahci_port, &identified_sectors) == 0 && identified_sectors > 0) {
+        // tot_sec32/hidd_sec etc. below are 32-bit fields (this driver
+        // doesn't implement exFAT-style huge-volume extensions), so clamp
+        // to what actually fits rather than wrapping into a bogus value
+        // on a >2TB drive.
+        disk_total_sectors = (identified_sectors > 0xFFFFFFFFu)
+                              ? 0xFFFFFFFFu
+                              : (uint32_t)identified_sectors;
+    }
+    // Guard: partition must fit within the disk.
+    if (new_part_lba >= disk_total_sectors) {
+        wm.print_to_focused("Error: partition start beyond disk end.\n");
+        return;
+    }
+    const uint32_t part_total_sectors = disk_total_sectors - (uint32_t)new_part_lba;
+
+    fat32_bpb_t new_bpb;
+    memset(&new_bpb, 0, sizeof(fat32_bpb_t));
+    new_bpb.jmp[0] = 0xEB; new_bpb.jmp[1] = 0x58; new_bpb.jmp[2] = 0x90;
+    memcpy(new_bpb.oem, "MSWIN4.1", 8);
+    new_bpb.bytes_per_sec = 512;
+    new_bpb.rsvd_sec_cnt  = 32;
+    new_bpb.num_fats      = 2;
+    new_bpb.root_ent_cnt  = 0;      // must be 0 for FAT32
+    new_bpb.tot_sec16     = 0;      // must be 0 for FAT32 (use tot_sec32)
+    new_bpb.media         = 0xF8;
+    new_bpb.fat_sz16      = 0;      // must be 0 for FAT32 (use fat_sz32)
+    new_bpb.sec_per_trk   = 32;
+    new_bpb.num_heads     = 64;
+    new_bpb.hidd_sec      = (uint32_t)new_part_lba;  // sectors before this partition
+    new_bpb.tot_sec32     = part_total_sectors;        // partition size, NOT disk size
+
+    // ── sec_per_clus: scales with volume size, like a real formatter ──────
+    // Must clear the FAT32-spec floor of >=65525 clusters (below that, a
+    // volume is FAT16 territory), but among candidates that clear it,
+    // prefer the LARGEST cluster size that keeps the total cluster count
+    // under a soft cap -- otherwise every disk bigger than a few hundred
+    // MB ends up at 512-byte clusters, which is what used to make the
+    // FAT table (and chkdsk's cluster bitmap, 1 bit/cluster) balloon to
+    // hundreds of MB on any real-sized drive.
+    {
+        uint8_t spc_candidates[] = { 1, 2, 4, 8, 16, 32, 64, 128 };
+        const uint32_t MIN_CLUSTERS = 65525u;          // FAT32 spec floor
+        const uint32_t MAX_CLUSTERS_SOFT_CAP = 8000000u; // ~1MB chkdsk bitmap worst case
+        uint8_t best_valid  = 0; // largest spc that clears the floor at all
+        uint8_t best_capped = 0; // largest spc that ALSO stays under the soft cap
+
+        for (uint32_t k = 0; k < sizeof(spc_candidates); k++) {
+            uint8_t spc = spc_candidates[k];
+            uint32_t tmp1 = part_total_sectors - new_bpb.rsvd_sec_cnt;
+            uint32_t tmp2 = (256u * spc + new_bpb.num_fats) / 2u;
+            uint32_t fat_sz = (tmp1 + tmp2 - 1u) / tmp2;
+            uint32_t data_sec = part_total_sectors
+                                - new_bpb.rsvd_sec_cnt
+                                - new_bpb.num_fats * fat_sz;
+            uint32_t clusters = data_sec / spc;
+            if (clusters < MIN_CLUSTERS) continue;
+            best_valid = spc; // candidates are ascending, so this ends up largest
+            if (clusters <= MAX_CLUSTERS_SOFT_CAP) best_capped = spc;
+        }
+        // Prefer a cluster size that keeps the count sane; if even the
+        // largest candidate (64KB clusters) can't get a truly enormous
+        // disk under the cap, fall back to the largest one that at least
+        // clears the FAT32 floor -- best effort, and the heap-size /
+        // chkdsk-memory-check safety nets below still apply on top.
+        uint8_t chosen = best_capped ? best_capped : (best_valid ? best_valid : 128);
+        new_bpb.sec_per_clus = chosen;
+    }
+
+    // ── fat_sz32 from Microsoft FAT spec section 3.5 ─────────────────────
+    {
+        uint32_t tmp1 = part_total_sectors - new_bpb.rsvd_sec_cnt;
+        uint32_t tmp2 = (256u * new_bpb.sec_per_clus + new_bpb.num_fats) / 2u;
+        new_bpb.fat_sz32 = (tmp1 + tmp2 - 1u) / tmp2;
+    }
+
+    new_bpb.root_clus   = 2;
+    new_bpb.fs_info     = 1;        // FSInfo at partition + 1
+    new_bpb.bk_boot_sec = 6;        // backup boot sector at partition + 6
+    new_bpb.ext_flags   = 0;        // mirror FATs
+    new_bpb.fs_ver      = 0x0000;   // FAT32 version 0.0 — required by spec
+    new_bpb.drv_num     = 0x80;
+    new_bpb.res1        = 0;
+    new_bpb.boot_sig    = 0x29;
+    new_bpb.vol_id      = 0x12345678;
+    memcpy(new_bpb.vol_lab,      "MYOS VOL   ", 11);
+    memcpy(new_bpb.fil_sys_type, "FAT32   ",    8);
+
+    // ── Commit globals NOW, before any sector writes that depend on them ──
+    // All write helpers (write_fat_entry, cluster_to_lba, …) use the
+    // module-level fat_start_sector / data_start_sector globals, so they
+    // must be correct before we call them — not after.
+    memcpy(&bpb, &new_bpb, sizeof(fat32_bpb_t));
+    g_partition_lba   = new_part_lba;
+    fat_start_sector  = (uint32_t)(new_part_lba + bpb.rsvd_sec_cnt);
+    data_start_sector = fat_start_sector + (bpb.num_fats * bpb.fat_sz32);
+
+    // ── Write MBR (raw disk only) ─────────────────────────────────────────
+    if (raw_disk) {
+        wm.print_to_focused("Writing MBR and partition table...\n");
+        char* mbr = new char[SECTOR_SIZE];
+        memset(mbr, 0, SECTOR_SIZE);
+
+        // Minimal x86 bootstrap stub (prints "No bootable OS", halts).
+        static const uint8_t boot_stub[] = {
+            0xFA,                         // CLI
+            0x31, 0xC0,                   // XOR AX, AX
+            0x8E, 0xD0,                   // MOV SS, AX
+            0xBC, 0x00, 0x7C,             // MOV SP, 0x7C00
+            0xFB,                         // STI
+            0x0E,                         // PUSH CS
+            0x1F,                         // POP DS
+            0xBE, 0x1E, 0x7C,             // MOV SI, msg_offset
+            0xAC,                         // LODSB
+            0x08, 0xC0,                   // OR AL, AL
+            0x74, 0x09,                   // JZ halt
+            0xB4, 0x0E,                   // MOV AH, 0x0E
+            0xBB, 0x07, 0x00,             // MOV BX, 7
+            0xCD, 0x10,                   // INT 0x10
+            0xEB, 0xF2,                   // JMP loop
+            0xF4,                         // HLT
+            0xEB, 0xFD,                   // JMP halt
+            'N','o',' ','b','o','o','t','a','b','l','e',' ','O','S','\r','\n', 0x00
+        };
+        memcpy(mbr, boot_stub, sizeof(boot_stub));
+
+        // Partition table entry 0: type 0x0C (FAT32 LBA), bootable.
+        // CHS values set to 0xFE/0xFF/0xFF (LBA-mode placeholder, per
+        // the convention used by Windows Disk Management and fdisk).
+        uint8_t* pt = (uint8_t*)mbr + 446;
+        pt[0] = 0x80;                                // bootable
+        pt[1] = 0xFE; pt[2] = 0xFF; pt[3] = 0xFF;  // CHS start placeholder
+        pt[4] = 0x0C;                                // type: FAT32 LBA
+        pt[5] = 0xFE; pt[6] = 0xFF; pt[7] = 0xFF;  // CHS end placeholder
+        *(uint32_t*)(pt +  8) = PART_START_LBA;
+        *(uint32_t*)(pt + 12) = part_total_sectors;
+        // Entries 1–3: zeroed (unused).
+
+        mbr[510] = (char)0x55;
+        mbr[511] = (char)0xAA;
+
+        bool was = g_fs_encryption_enabled;
+        g_fs_encryption_enabled = false;
+        if (read_write_sectors(g_ahci_port, 0, 1, true, mbr) != 0)
+            wm.print_to_focused("Warning: MBR write failed.\n");
+        else
+            wm.print_to_focused("MBR + partition table written.\n");
+        g_fs_encryption_enabled = was;
+        delete[] mbr;
+    }
+
+    // ── Write VBR (Volume Boot Record = BPB sector) at new_part_lba ──────
+    wm.print_to_focused("Writing volume boot record...\n");
+    char* boot_sector_buffer = new char[SECTOR_SIZE];
+    memset(boot_sector_buffer, 0, SECTOR_SIZE);
+    memcpy(boot_sector_buffer, &new_bpb, sizeof(fat32_bpb_t));
+    boot_sector_buffer[510] = (char)0x55;
+    boot_sector_buffer[511] = (char)0xAA;
+
+    bool boot_sec_was_enc = g_fs_encryption_enabled;
+    g_fs_encryption_enabled = false;   // BPB/FSInfo must be plaintext
+
+    if (read_write_sectors(g_ahci_port, new_part_lba, 1, true, boot_sector_buffer) != 0) {
+        wm.print_to_focused("Error: Failed to write volume boot record.\n");
+        delete[] boot_sector_buffer;
+        g_fs_encryption_enabled = boot_sec_was_enc;
+        return;
+    }
+    // Backup VBR at partition + bk_boot_sec (=6).
+    wm.print_to_focused("Writing backup boot sector...\n");
+    if (read_write_sectors(g_ahci_port, new_part_lba + new_bpb.bk_boot_sec, 1,
+                           true, boot_sector_buffer) != 0)
+        wm.print_to_focused("Warning: backup boot sector write failed.\n");
+
+    // ── Write FSInfo sector at partition + fs_info (=1) ───────────────────
+    // Signatures per FAT32 spec Table 9:
+    //   offset   0  LeadSig  = 0x41615252  ("RRaA")
+    //   offset 484  StrucSig = 0x61417272  ("rrAa")
+    //   offset 488  FreeCount= 0xFFFFFFFF  (unknown — recompute on first mount)
+    //   offset 492  NextFree = 0xFFFFFFFF  (unknown — search from cluster 2)
+    //   offset 508  TrailSig = 0xAA550000
+    wm.print_to_focused("Writing FSInfo sector...\n");
+    memset(boot_sector_buffer, 0, SECTOR_SIZE);
+    *(uint32_t*)(boot_sector_buffer +   0) = 0x41615252u;
+    *(uint32_t*)(boot_sector_buffer + 484) = 0x61417272u;
+    *(uint32_t*)(boot_sector_buffer + 488) = 0xFFFFFFFFu;
+    *(uint32_t*)(boot_sector_buffer + 492) = 0xFFFFFFFFu;
+    *(uint32_t*)(boot_sector_buffer + 508) = 0xAA550000u;
+    if (read_write_sectors(g_ahci_port, new_part_lba + new_bpb.fs_info, 1,
+                           true, boot_sector_buffer) != 0)
+        wm.print_to_focused("Warning: FSInfo sector write failed.\n");
+    // Backup FSInfo at bk_boot_sec + 1 (recommended by spec, not required).
+    read_write_sectors(g_ahci_port, new_part_lba + new_bpb.bk_boot_sec + 1, 1,
+                       true, boot_sector_buffer);
+
+    delete[] boot_sector_buffer;
+    g_fs_encryption_enabled = boot_sec_was_enc;
+
+    // ── Clear FAT1 + FAT2 ─────────────────────────────────────────────────
+    // fat_start_sector already reflects the correct absolute LBA.
+    uint8_t* zero_sector = new uint8_t[SECTOR_SIZE];
+    memset(zero_sector, 0, SECTOR_SIZE);
+    wm.print_to_focused("Clearing FATs...\n");
+    for (uint32_t i = 0; i < bpb.fat_sz32; ++i) {
+        read_write_sectors(g_ahci_port, fat_start_sector + i, 1, true, zero_sector);                    // FAT1
+        read_write_sectors(g_ahci_port, fat_start_sector + bpb.fat_sz32 + i, 1, true, zero_sector);    // FAT2
+    }
+
+    // ── Clear root directory cluster ───────────────────────────────────────
+    wm.print_to_focused("Clearing root directory...\n");
+    for (uint8_t i = 0; i < bpb.sec_per_clus; ++i) {
+        read_write_sectors(g_ahci_port, cluster_to_lba(bpb.root_clus) + i, 1, true, zero_sector);
+    }
+    delete[] zero_sector;
+
+    // ── Write initial FAT entries ──────────────────────────────────────────
+    // Cluster 0: media-type byte (0x0FFFFF_F8 for fixed disk, mirroring BPB_Media).
+    // Cluster 1: end-of-chain / dirty-flag word (0x0FFFFFFF = clean).
+    // Cluster 2: root directory — single cluster, end of chain.
+    wm.print_to_focused("Writing initial FAT entries...\n");
+    write_fat_entry(0, 0x0FFFFFF8); // Media descriptor
+    write_fat_entry(1, 0x0FFFFFFF); // Clean/EOC
+    write_fat_entry(bpb.root_clus, 0x0FFFFFFF); // Root directory EOC
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Volume label directory entry in the root cluster.
+    //
+    // The FAT32 spec (section 6) requires that the first entry in the root
+    // directory is a volume-label entry (ATTR_VOLUME_ID = 0x08) whose
+    // DIR_Name field matches BPB_VolLab. Without it Windows Explorer shows
+    // "Local Disk" instead of the volume name, and chkdsk reports a missing
+    // volume label as a warning.
+    //
+    // The entry is written AFTER the initial FAT entries so that
+    // cluster_to_lba(bpb.root_clus) is already valid and fat_start_sector
+    // / data_start_sector have been updated for the MBR-partition case.
+    // ─────────────────────────────────────────────────────────────────────
+    {
+        uint8_t* root_sector = new uint8_t[SECTOR_SIZE];
+        memset(root_sector, 0, SECTOR_SIZE);
+        fat_dir_entry_t* vol_entry = (fat_dir_entry_t*)root_sector;
+        memcpy(vol_entry->name, new_bpb.vol_lab, 11); // "MYOS VOL   "
+        vol_entry->attr = ATTR_VOLUME_ID;
+        // crt_time / crt_date — use a fixed timestamp (2024-01-01 00:00:00).
+        // FAT date: bits 15-9 = year-1980, bits 8-5 = month, bits 4-0 = day.
+        // FAT time: bits 15-11 = hour, bits 10-5 = minute, bits 4-0 = sec/2.
+        vol_entry->crt_date = (uint16_t)((44 << 9) | (1 << 5) | 1); // 2024-01-01
+        vol_entry->wrt_date = vol_entry->crt_date;
+        vol_entry->lst_acc_date = vol_entry->crt_date;
+        vol_entry->fst_clus_hi = 0;
+        vol_entry->fst_clus_lo = 0;
+        vol_entry->file_size   = 0;
+        // Write to the first sector of the root cluster (already zeroed
+        // above, but we only wrote zeros — the volume entry goes here now).
+        bool vl_ok = (read_write_sectors(
+            g_ahci_port, cluster_to_lba(bpb.root_clus), 1, true, root_sector) == 0);
+        if (!vl_ok) wm.print_to_focused("Warning: volume label dir entry write failed.\n");
+        delete[] root_sector;
+        wm.print_to_focused("Volume label directory entry written.\n");
+    }
+
+    wm.print_to_focused("Format complete. Re-initializing filesystem...\n");
+    if (fat32_init()) {
+        wm.print_to_focused("FAT32 FS re-initialized successfully.\n");
+    } else {
+        wm.print_to_focused("FAT32 FS re-initialization failed.\n");
+        // Diagnostic: read the BPB sector back as plaintext and report what
+        // is actually on disk. g_partition_lba is the partition's first
+        // sector (sector 0 holds the MBR on a raw disk, not the BPB).
+        char* vb = new char[SECTOR_SIZE];
+        if (vb) {
+            bool was = g_fs_encryption_enabled;
+            g_fs_encryption_enabled = false;
+            int rr = read_write_sectors(g_ahci_port, g_partition_lba, 1, false, vb);
+            g_fs_encryption_enabled = was;
+            if (rr != 0) {
+                wm.print_to_focused("  diag: boot-sector read-back FAILED.\n");
+            } else {
+                // fil_sys_type sits at BPB offset 82.
+                char fst[9];
+                for (int k = 0; k < 8; ++k) fst[k] = vb[82 + k];
+                fst[8] = '\0';
+                uint8_t s0 = (uint8_t)vb[510], s1 = (uint8_t)vb[511];
+                char msg[80];
+                snprintf(msg, sizeof(msg),
+                         "  diag: fs_type='%s' sig=%02X%02X\n",
+                         fst, s0, s1);
+                wm.print_to_focused(msg);
+            }
+            delete[] vb;
+        }
+    }
+}
+class FileExplorerWindow : public Window {
+private:
+    char current_path[256];
+    fat_dir_entry_t file_list[128];
+    int num_files;
+    int scroll_offset;
+    // Row index in "display row space" (0 = the ".." row if has_parent_row,
+    // otherwise row 0 is file_list[0]; see selected_file_index() below) --
+    // NOT a file_list[] index by itself. -1 = nothing selected. Row space
+    // is what lets a single field back both mouse selection and the
+    // keyboard cursor, and let the ".." row be selectable/highlighted
+    // like any other row.
+    int selected_index;
+    // True whenever current_path isn't root -- draws a synthetic ".."
+    // row at the top of the list (row 0) that navigates up on click.
+    // It's not a real directory entry (fat32_list_directory() hides
+    // "." / ".." the same way ls does), so it's tracked here instead.
+    bool has_parent_row;
+    // Double-click detection state. FIX: this used to be `static` local
+    // variables inside on_mouse_click() -- a function-local static is
+    // ONE variable shared by every FileExplorerWindow instance (and
+    // never reset), so clicking window A then window B could register
+    // as a double-click on window B, and clicking right after
+    // navigate_into()/navigate_up() reused stale state from the
+    // directory you just left. Making these real per-window members
+    // (and resetting them in refresh_contents()) fixes both.
+    int last_click_row;
+    uint32_t last_click_tick;
+
+    // --- List / scrollbar geometry constants ---
+    // ROW_H must be >= the small icon size (14px) plus a little padding so
+    // rows never overlap/clip into each other.
+    static constexpr int TITLEBAR_H   = 25;
+    // FIX: current_path used to be drawn directly on top of the titlebar
+    // at a fixed x+100, overlapping the tail of the "File Explorer" title
+    // text (8px/char * 13 chars = 104px just for the word "Explorer" --
+    // anything drawn starting at x+100 collided with it) and getting
+    // harder to read the longer the path got, with nothing to fall back
+    // on for paths too wide for the window. A dedicated bar directly
+    // below the titlebar gives the current folder its own always-visible
+    // row, like a real file manager's address bar.
+    static constexpr int PATH_BAR_H   = 18;
+    static constexpr int LIST_TOP_PAD = 5;   // gap below path bar before first row
+    static constexpr int ROW_H        = 18;
+    static constexpr int SCROLLBAR_W  = 16;  // width of the scroll sidebar
+    static constexpr int ARROW_H      = 16;  // height of each up/down arrow button
+
+    int list_area_x() const { return x; }
+    int list_area_y() const { return y + TITLEBAR_H + PATH_BAR_H; }
+    int list_area_w() const { return w - SCROLLBAR_W; }
+    int list_area_h() const { return h - TITLEBAR_H - PATH_BAR_H; }
+
+    int max_visible_items() const {
+        int n = (list_area_h() - LIST_TOP_PAD) / ROW_H;
+        return n < 1 ? 1 : n;
+    }
+
+    // Real file/directory entries plus the synthetic ".." row (if any) --
+    // everything that actually occupies a row in the list.
+    int total_rows() const { return num_files + (has_parent_row ? 1 : 0); }
+
+    int max_scroll_offset() const {
+        int m = total_rows() - max_visible_items();
+        return m < 0 ? 0 : m;
+    }
+
+    void clamp_scroll() {
+        int max_off = max_scroll_offset();
+        if (scroll_offset > max_off) scroll_offset = max_off;
+        if (scroll_offset < 0) scroll_offset = 0;
+    }
+
+    int scrollbar_x() const { return x + w - SCROLLBAR_W; }
+    int scrollbar_top() const { return y + TITLEBAR_H + PATH_BAR_H; }
+    int scrollbar_track_top() const { return scrollbar_top() + ARROW_H; }
+    int scrollbar_track_h() const { return list_area_h() - 2 * ARROW_H; }
+
+    // Peeks at a file's first 4 bytes and checks them against the ELF
+    // magic number (0x7F 'E' 'L' 'F'), the same check validate_elf_header()
+    // does on the full header. We deliberately don't depend on the
+    // Elf32_Ehdr type here (it's defined much later in this translation
+    // unit, after FileExplorerWindow) — a raw byte comparison is all
+    // "is this actually an ELF" requires.
+    // Builds the absolute path of `filename` as it sits inside this
+    // window's current_path (e.g. current_path="/test", filename="foo"
+    // -> "/test/foo"). Used everywhere this window needs to read/run a
+    // file, instead of a bare filename -- a bare filename would resolve
+    // against the SHELL's current_directory_cluster, which has no
+    // reason to match whatever folder this particular Explorer window
+    // happens to be showing.
+    void full_path_for(const char* filename, char* out, size_t out_size) {
+        strncpy(out, current_path, out_size - 1);
+        out[out_size - 1] = '\0';
+        path_push_component(out, out_size, filename);
+    }
+
+    bool is_elf_file(int idx) {
+        if (idx < 0 || idx >= num_files) return false;
+        if (file_list[idx].attr & FAT_ATTR_DIRECTORY) return false;
+        if (file_list[idx].file_size < 4) return false;
+
+        char filename[13];
+        fat32_get_fne_from_entry(&file_list[idx], filename);
+        char full_path[256];
+        full_path_for(filename, full_path, sizeof(full_path));
+        char* data = fat32_read_file_as_string_path(full_path);
+        if (!data) return false;
+
+        bool is_elf = (unsigned char)data[0] == 0x7F &&
+                       data[1] == 'E' && data[2] == 'L' && data[3] == 'F';
+        delete[] data;
+        return is_elf;
+    }
+
+    // Moves current_path up one level (via fat32_resolve_path's ".."
+    // handling, which reads the real on-disk ".." entry) and re-lists.
+    // No-op at root, since path_pop_component()/fat32_get_parent_cluster()
+    // both treat root as its own parent.
+    void navigate_up() {
+        char new_path[256];
+        strncpy(new_path, current_path, sizeof(new_path) - 1);
+        new_path[sizeof(new_path) - 1] = '\0';
+        path_pop_component(new_path);
+
+        uint32_t new_cluster;
+        char resolved[256];
+        if (!fat32_resolve_path(new_path, bpb.root_clus, "/", &new_cluster, resolved, sizeof(resolved))) return;
+        strncpy(current_path, resolved, 255);
+        current_path[255] = '\0';
+        selected_index = -1;
+        scroll_offset = 0;
+        refresh_contents();
+    }
+
+    // Descends into a named subdirectory of current_path and re-lists.
+    // Silently does nothing if `name` isn't actually a directory there
+    // (shouldn't happen -- this is only ever called with a name we just
+    // listed as ATTR_DIRECTORY -- but resolving fresh from disk rather
+    // than trusting the cached file_list entry keeps this in sync with
+    // whatever's actually on disk right now).
+    void navigate_into(const char* name) {
+        char new_path[256];
+        strncpy(new_path, current_path, sizeof(new_path) - 1);
+        new_path[sizeof(new_path) - 1] = '\0';
+        path_push_component(new_path, sizeof(new_path), name);
+
+        uint32_t new_cluster;
+        char resolved[256];
+        if (!fat32_resolve_path(new_path, bpb.root_clus, "/", &new_cluster, resolved, sizeof(resolved))) return;
+        strncpy(current_path, resolved, 255);
+        current_path[255] = '\0';
+        selected_index = -1;
+        scroll_offset = 0;
+        refresh_contents();
+    }
+
+    // Double-click / right-click "Run" behavior: inspect the actual file
+    // contents (not just its extension) and either launch it through the
+    // Bochs CPU emulator (ELF binaries) or open it in the text editor
+    // (anything else). Directories descend into themselves instead.
+    // "bochs <file>" is used rather than "run <file>" — "run" is not a
+    // recognized shell command in handle_command(), so building a
+    // "run %s" command string (as this code used to) silently failed;
+    // "bochs" is the actual working ELF-execution entry point.
+    void open_or_run(int idx) {
+        if (idx < 0 || idx >= num_files) return;
+
+        char filename[13];
+        fat32_get_fne_from_entry(&file_list[idx], filename);
+
+        if (file_list[idx].attr & FAT_ATTR_DIRECTORY) {
+            navigate_into(filename);
+            return;
+        }
+
+        char full_path[256];
+        full_path_for(filename, full_path, sizeof(full_path));
+
+        char command_buffer[280];
+        if (is_elf_file(idx)) {
+            snprintf(command_buffer, sizeof(command_buffer), "bochs %s", full_path);
+        } else {
+            snprintf(command_buffer, sizeof(command_buffer), "edit \"%s\"", full_path);
+        }
+        launch_terminal_with_command(command_buffer);
+    }
+
+    // Returns true and consumes the click if it landed on the scrollbar.
+    bool handle_scrollbar_click(int mx, int my) {
+        if (mx < scrollbar_x() || mx >= scrollbar_x() + SCROLLBAR_W) return false;
+        if (my < scrollbar_top() || my >= scrollbar_top() + list_area_h()) return false;
+
+        int sb_top = scrollbar_top();
+        int track_top = scrollbar_track_top();
+        int track_h = scrollbar_track_h();
+
+        if (my < sb_top + ARROW_H) {
+            // Up arrow
+            scroll_offset--;
+        } else if (my >= sb_top + list_area_h() - ARROW_H) {
+            // Down arrow
+            scroll_offset++;
+        } else if (track_h > 0) {
+            // Track click: page up/down relative to the thumb position
+            int visible = max_visible_items();
+            int max_off = max_scroll_offset();
+            int rows = total_rows() > 0 ? total_rows() : 1;
+            int thumb_h = max_off > 0 ? (track_h * visible) / rows : track_h;
+            if (thumb_h < 8) thumb_h = 8;
+            if (thumb_h > track_h) thumb_h = track_h;
+            int thumb_y = track_top;
+            if (max_off > 0) {
+                thumb_y = track_top + ((track_h - thumb_h) * scroll_offset) / max_off;
+            }
+            if (my < thumb_y) {
+                scroll_offset -= visible; // page up
+            } else if (my >= thumb_y + thumb_h) {
+                scroll_offset += visible; // page down
+            }
+        }
+        clamp_scroll();
+        return true;
+    }
+
+    void draw_scrollbar() {
+        using namespace ColorPalette;
+        int sb_x = scrollbar_x();
+        int sb_top = scrollbar_top();
+        int sb_h = list_area_h();
+
+        // Track background
+        draw_rect_filled(sb_x, sb_top, SCROLLBAR_W, sb_h, BUTTON_FACE);
+        draw_rect_filled(sb_x, sb_top, 1, sb_h, BUTTON_SHADOW);
+
+        // Up arrow button
+        draw_rect_filled(sb_x + 1, sb_top + 1, SCROLLBAR_W - 2, ARROW_H - 2, BUTTON_FACE);
+        draw_rect_filled(sb_x + 1, sb_top + 1, SCROLLBAR_W - 2, 1, BUTTON_HIGHLIGHT);
+        draw_rect_filled(sb_x + 1, sb_top + ARROW_H - 2, SCROLLBAR_W - 2, 1, BUTTON_SHADOW);
+        draw_char('^', sb_x + 4, sb_top + 4, TEXT_BLACK);
+
+        // Down arrow button
+        int down_y = sb_top + sb_h - ARROW_H;
+        draw_rect_filled(sb_x + 1, down_y + 1, SCROLLBAR_W - 2, ARROW_H - 2, BUTTON_FACE);
+        draw_rect_filled(sb_x + 1, down_y + 1, SCROLLBAR_W - 2, 1, BUTTON_HIGHLIGHT);
+        draw_rect_filled(sb_x + 1, down_y + ARROW_H - 2, SCROLLBAR_W - 2, 1, BUTTON_SHADOW);
+        draw_char('v', sb_x + 4, down_y + 4, TEXT_BLACK);
+
+        // Thumb
+        int track_top = scrollbar_track_top();
+        int track_h = scrollbar_track_h();
+        if (track_h > 0) {
+            int visible = max_visible_items();
+            int max_off = max_scroll_offset();
+            int thumb_h = max_off > 0 ? (track_h * visible) / (total_rows() > 0 ? total_rows() : 1) : track_h;
+            if (thumb_h < 8) thumb_h = 8;
+            if (thumb_h > track_h) thumb_h = track_h;
+            int thumb_y = track_top;
+            if (max_off > 0) {
+                thumb_y = track_top + ((track_h - thumb_h) * scroll_offset) / max_off;
+            }
+            draw_rect_filled(sb_x + 2, thumb_y, SCROLLBAR_W - 4, thumb_h, BUTTON_SHADOW);
+            draw_rect_filled(sb_x + 2, thumb_y, SCROLLBAR_W - 4, 1, BUTTON_HIGHLIGHT);
+        }
+    }
+
+public:
+    FileExplorerWindow(int x, int y, const char* path) 
+        : Window(x, y, 400, 300, "File Explorer"), num_files(0), scroll_offset(0), selected_index(-1),
+          has_parent_row(false), last_click_row(-1), last_click_tick(0) {
+        strncpy(current_path, path, 255);
+        current_path[255] = '\0';
+        refresh_contents();
+    }
+
+    // Row-space index (see selected_index's declaration comment) for the
+    // currently selected/highlighted real file, or -1 if nothing valid
+    // is selected (including when the ".." row is what's selected).
+    int selected_file_index() const {
+        if (selected_index < 0) return -1;
+        int fi = selected_index - (has_parent_row ? 1 : 0);
+        return (fi >= 0 && fi < num_files) ? fi : -1;
+    }
+
+    // Scrolls just enough to bring row `row` into view.
+    void ensure_row_visible(int row) {
+        int visible = max_visible_items();
+        if (row < scroll_offset) scroll_offset = row;
+        else if (row >= scroll_offset + visible) scroll_offset = row - visible + 1;
+        clamp_scroll();
+    }
+
+    void refresh_contents() override {
+        num_files = fat32_list_directory(current_path, file_list, 128);
+        has_parent_row = (strcmp(current_path, "/") != 0);
+        if (selected_index >= num_files + (has_parent_row ? 1 : 0)) selected_index = -1;
+        // A directory change invalidates any in-flight double-click --
+        // otherwise a quick click on the new listing's first row could
+        // be paired with the click that navigated here and mistakenly
+        // fire a second "open" immediately.
+        last_click_row = -1;
+        last_click_tick = 0;
+        clamp_scroll();
+    }
+
+    void draw() override {
+        if (is_closed) return;
+        using namespace ColorPalette;
+        
+        uint32_t titlebar_color = has_focus ? TITLEBAR_ACTIVE : TITLEBAR_INACTIVE;
+        draw_rect_filled(x, y, w, TITLEBAR_H, titlebar_color);
+        draw_string(title, x + 5, y + 8, TEXT_WHITE);
+
+        draw_rect_filled(x + w - 22, y + 4, 18, 18, BUTTON_CLOSE);
+        draw_string("X", x + w - 17, y + 8, TEXT_WHITE);
+
+        // Dedicated path bar: the current folder, always in its own row
+        // so it's never competing for space with the titlebar text. Long
+        // paths are tail-truncated with a leading "..." -- the DEEPEST
+        // folder (the one you're actually looking at) is what matters
+        // most, so it's the part kept visible rather than the start.
+        draw_rect_filled(x, y + TITLEBAR_H, w, PATH_BAR_H, FILE_EXPLORER_BG);
+        {
+            const int PATH_PAD_X = 6;
+            int avail_chars = (w - 2 * PATH_PAD_X) / 8;
+            if (avail_chars < 1) avail_chars = 1;
+            int path_len = (int)strlen(current_path);
+            if (path_len <= avail_chars) {
+                draw_string(current_path, x + PATH_PAD_X, y + TITLEBAR_H + 5, TEXT_BLACK);
+            } else if (avail_chars > 3) {
+                char truncated[256];
+                truncated[0] = '.'; truncated[1] = '.'; truncated[2] = '.';
+                int tail_len = avail_chars - 3;
+                strncpy(truncated + 3, current_path + (path_len - tail_len), tail_len);
+                truncated[avail_chars] = '\0';
+                draw_string(truncated, x + PATH_PAD_X, y + TITLEBAR_H + 5, TEXT_BLACK);
+            }
+        }
+        
+        // Main content area
+        draw_rect_filled(x, list_area_y(), w, list_area_h(), FILE_EXPLORER_BG);
+        
+        // Draw borders
+        for (int i = 0; i < w; i++) put_pixel_back(x + i, y, WINDOW_BORDER);
+        for (int i = 0; i < w; i++) put_pixel_back(x + i, y + h - 1, WINDOW_BORDER);
+        for (int i = 0; i < h; i++) put_pixel_back(x, y + i, WINDOW_BORDER);
+        for (int i = 0; i < h; i++) put_pixel_back(x + w - 1, y + i, WINDOW_BORDER);
+
+        clamp_scroll();
+
+        // Draw file list — rows are ROW_H tall and icons are the small
+        // (14x14) variant, so each row's icon fits entirely within its own
+        // row and never bleeds into neighboring rows.
+        int visible = max_visible_items();
+        int la_x = list_area_x();
+        int la_y = list_area_y();
+        int la_w = list_area_w();
+
+        for (int i = 0; i < visible; ++i) {
+            int row_idx = scroll_offset + i;
+            if (row_idx >= total_rows()) break;
+
+            int item_y = la_y + LIST_TOP_PAD + i * ROW_H;
+
+            if (has_parent_row && row_idx == 0) {
+                // Synthetic "up one level" row -- selectable via keyboard
+                // like any other row (see on_key_press), so it highlights
+                // the same way real entries do.
+                if (row_idx == selected_index) {
+                    draw_rect_filled(la_x + 2, item_y, la_w - 4, ROW_H - 2, TITLEBAR_ACTIVE);
+                }
+                draw_icon_folder_small(la_x + 4, item_y + 2);
+                draw_string("..", la_x + 24, item_y + 5,
+                             (row_idx == selected_index) ? TEXT_WHITE : TEXT_BLACK);
+                continue;
+            }
+
+            int file_idx = row_idx - (has_parent_row ? 1 : 0);
+            char filename[13];
+            fat32_get_fne_from_entry(&file_list[file_idx], filename);
+
+            bool is_selected = (row_idx == selected_index);
+            if (is_selected) {
+                draw_rect_filled(la_x + 2, item_y, la_w - 4, ROW_H - 2, TITLEBAR_ACTIVE);
+            }
+
+            if (file_list[file_idx].attr & FAT_ATTR_DIRECTORY) {
+                draw_icon_folder_small(la_x + 4, item_y + 2);
+            } else {
+                bool is_shortcut = strstr(filename, ".LNK") != nullptr;
+                draw_icon_file_small(la_x + 4, item_y + 2, is_shortcut);
+            }
+
+            uint32_t name_color = is_selected ? TEXT_WHITE : TEXT_BLACK;
+            draw_string(filename, la_x + 24, item_y + 5, name_color);
+        }
+
+        // Scroll sidebar — always drawn so the list column width is
+        // consistent, and it visually communicates whether there's more
+        // content (short/tall thumb) even when nothing is scrollable yet.
+        draw_scrollbar();
+    }
+
+    void on_key_press(char c) override {
+        int rows = total_rows();
+        if (rows == 0) return;
+
+        if (c == KEY_UP) {
+            selected_index = (selected_index < 0) ? rows - 1
+                            : (selected_index > 0 ? selected_index - 1 : 0);
+            ensure_row_visible(selected_index);
+        } else if (c == KEY_DOWN) {
+            selected_index = (selected_index < 0) ? 0
+                            : (selected_index < rows - 1 ? selected_index + 1 : rows - 1);
+            ensure_row_visible(selected_index);
+        } else if (c == '\n') {
+            if (selected_index < 0) return;
+            if (has_parent_row && selected_index == 0) {
+                navigate_up();
+                return;
+            }
+            int file_idx = selected_file_index();
+            if (file_idx >= 0) open_or_run(file_idx);
+        }
+    }
+
+    void on_mouse_right_click(int mx, int my) override {
+        // Right-clicks on the scrollbar shouldn't open a file context menu.
+        if (mx >= scrollbar_x() && mx < scrollbar_x() + SCROLLBAR_W) return;
+
+        int content_y = my - (list_area_y() + LIST_TOP_PAD);
+        if (content_y < 0) return;
+        int row_idx = scroll_offset + (content_y / ROW_H);
+        if (row_idx >= total_rows()) return;
+        if (has_parent_row && row_idx == 0) return; // ".." has no context menu
+
+        int clicked_idx = row_idx - (has_parent_row ? 1 : 0);
+        selected_index = row_idx;
+        char filename[13];
+        fat32_get_fne_from_entry(&file_list[clicked_idx], filename);
+
+        // Tell the window manager to show the context menu for this
+        // file. "Run" is offered whenever the file's contents are
+        // actually an ELF binary, not just when its name ends in
+        // .obj/.OBJ.
+        wm.show_file_context_menu(mx, my, filename, is_elf_file(clicked_idx));
+    }
+
+    void on_mouse_click(int mx, int my) override {
+        // Scrollbar clicks (arrows / track) are handled here and don't
+        // affect file selection.
+        if (handle_scrollbar_click(mx, my)) return;
+
+        int content_y = my - (list_area_y() + LIST_TOP_PAD);
+        if (content_y < 0) return;
+        int row_idx = scroll_offset + (content_y / ROW_H);
+        if (row_idx >= total_rows()) return;
+
+        if (has_parent_row && row_idx == 0) {
+            // ".." navigates immediately on a single click -- it isn't a
+            // real file to select/double-click, so there's no reason to
+            // make it wait for a second click the way real entries do.
+            selected_index = row_idx;
+            navigate_up();
+            return;
+        }
+
+        selected_index = row_idx;
+        int clicked_idx = row_idx - (has_parent_row ? 1 : 0);
+        // Double-click simulation. FIX: last_click_row/last_click_tick
+        // used to be `static` LOCAL variables here, which made them one
+        // variable shared by every FileExplorerWindow instance and never
+        // reset across navigation -- see the member declaration comment
+        // for the full explanation. They're real per-window state now,
+        // in row space (row_idx) rather than file-list space, so a click
+        // on ".." can never accidentally be compared against a real
+        // file's index either.
+        if (row_idx == last_click_row && (g_timer_ticks - last_click_tick) < 20) {
+            // Double click! Open in the editor, run it in the emulator,
+            // or descend into it, depending on what it actually is.
+            open_or_run(clicked_idx);
+        }
+        last_click_row = row_idx;
+        last_click_tick = g_timer_ticks;
+    }
+
+    void update() override {}
+};
