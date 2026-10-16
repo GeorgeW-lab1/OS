@@ -887,6 +887,13 @@ static SVGAResult vmware_svga_init(uint32_t w, uint32_t h) {
 // kernel_gfx_mouse_poll() needs to reach them from outside the loop.
 static bool g_gfx_click_left_pending  = false;
 static bool g_gfx_click_right_pending = false;
+// A click is only meant for a guest that is polling RIGHT NOW. If nothing polled
+// (e.g. the click landed in a plain terminal) the flag used to stay set forever
+// and the next GUI program launched would see it on its first poll and "press"
+// whatever widget was under the cursor. Stamp each click and expire it.
+static uint32_t g_gfx_click_left_stamp  = 0;
+static uint32_t g_gfx_click_right_stamp = 0;
+#define GFX_CLICK_TTL_TICKS 45   /* ~0.75 s at 60 Hz: generous for slow interpreted guests */
 
 // =============================================================================
 // LAG FIX: pacing helpers -- TSC time base calibrated against PIT channel 2
@@ -1157,8 +1164,8 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
 
     auto poll_and_latch = [&]() {
         poll_input_universal();
-        if ((mouse_left_down  && !prev_left)  || g_mouse_lpress_latch) { acc_lclick = true; g_gfx_click_left_pending  = true; }
-        if ((mouse_right_down && !prev_right) || g_mouse_rpress_latch) { acc_rclick = true; g_gfx_click_right_pending = true; }
+        if ((mouse_left_down  && !prev_left)  || g_mouse_lpress_latch) { acc_lclick = true; g_gfx_click_left_pending  = true; g_gfx_click_left_stamp  = (uint32_t)g_timer_ticks; }
+        if ((mouse_right_down && !prev_right) || g_mouse_rpress_latch) { acc_rclick = true; g_gfx_click_right_pending = true; g_gfx_click_right_stamp = (uint32_t)g_timer_ticks; }
         g_mouse_lpress_latch = g_mouse_rpress_latch = false;
         prev_left  = mouse_left_down;
         prev_right = mouse_right_down;
@@ -1383,11 +1390,13 @@ bool kernel_gfx_mouse_poll(int slot, int* out_x, int* out_y,
     if (mouse_left_down)  *out_buttons |= 0x01; // MOUSE_BIT_LEFT_DOWN
     if (mouse_right_down) *out_buttons |= 0x02; // MOUSE_BIT_RIGHT_DOWN
     if (g_gfx_click_left_pending) {
-        *out_buttons |= 0x04; // MOUSE_BIT_LEFT_CLICKED
+        if ((uint32_t)((uint32_t)g_timer_ticks - g_gfx_click_left_stamp) <= GFX_CLICK_TTL_TICKS)
+            *out_buttons |= 0x04; // MOUSE_BIT_LEFT_CLICKED
         g_gfx_click_left_pending = false;
     }
     if (g_gfx_click_right_pending) {
-        *out_buttons |= 0x08; // MOUSE_BIT_RIGHT_CLICKED
+        if ((uint32_t)((uint32_t)g_timer_ticks - g_gfx_click_right_stamp) <= GFX_CLICK_TTL_TICKS)
+            *out_buttons |= 0x08; // MOUSE_BIT_RIGHT_CLICKED
         g_gfx_click_right_pending = false;
     }
     return true;
